@@ -92,6 +92,7 @@ class ObjectFactory(abc.ABC):
         # scale mesh
         scale_transform = np.eye(4)
         np.fill_diagonal(scale_transform[:3, :3], self.scale)
+        # Check if scale_transform is identity
         self._mesh.transform(scale_transform)
         # convert from mesh object frame to simulator object frame
         x, y, z, w = self.vis_frame_rot

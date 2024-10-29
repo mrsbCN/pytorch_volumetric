@@ -110,13 +110,14 @@ class RobotScene:
         mask = torch.where(sdf_vals < -self.threshold, torch.zeros_like(sdf_vals), torch.ones_like(sdf_vals))
         return query_points, mask
 
-    def get_visualization_meshes(self, q: torch.Tensor, env_q: torch.Tensor = None):
-        pcd = o3d.geometry.PointCloud()
+    def get_visualization_meshes(self, q: torch.Tensor, env_q: torch.Tensor = None, pcd=None):
         self.robot_sdf.set_joint_configuration(q)
 
         tfs = self._get_desired_tfs().inverse()
-        pts = tfs.transform_points(self.robot_query_points).reshape(-1, 3)
-        pcd.points = o3d.utility.Vector3dVector(pts.cpu().numpy())
+        if pcd is None:
+            pcd = o3d.geometry.PointCloud()
+            pts = tfs.transform_points(self.robot_query_points).reshape(-1, 3)
+            pcd.points = o3d.utility.Vector3dVector(pts.cpu().numpy())
         if env_q is not None:
             self.scene_sdf.set_joint_configuration(env_q)
         self.scene_sdf.precompute_sdf()
