@@ -131,7 +131,8 @@ class RobotScene:
         for scene_mesh, c in zip(scene_meshes, colors):
             scene_mesh.paint_uniform_color(c)
         # scene_mesh = self.scene_sdf.obj_factory._mesh.transform(self.scene_transform.get_matrix()[0].cpu().numpy())
-        return pv.get_transformed_meshes(self.robot_sdf) + [pcd] + scene_meshes
+        # return pv.get_transformed_meshes(self.robot_sdf) + [pcd] + scene_meshes
+        return pv.get_transformed_meshes(self.robot_sdf), [pcd] + scene_meshes
 
     def visualize_robot(self, q: torch.Tensor, env_q: torch.Tensor = None):
         meshes = self.get_visualization_meshes(q, env_q)
@@ -427,12 +428,17 @@ class RobotScene:
             dclosest_dq = (rob_jac_expanded @ closest_pts_grad.unsqueeze(-1)).squeeze(-1)
             dclosest_dq = torch.sum(dclosest_dq, dim=2)
 
+            env_jac_expanded = env_jacobian.transpose(2, 3).unsqueeze(1).expand(B, 3, self.grad_smooth_points, -1, 3)
+            dclosest_denv_q = (env_jac_expanded @ closest_pts_grad.unsqueeze(-1)).squeeze(-1)
+            dclosest_denv_q = torch.sum(dclosest_denv_q, dim=2)
+
             q_grad = (rob_jacobian.transpose(2, 3) @ sdf_grad_world_frame.unsqueeze(-1)).squeeze(-1)
             q_env_grad = (env_jacobian.transpose(2, 3) @ -sdf_weighted_grad.unsqueeze(-1)).squeeze(-1)
             rvals['grad_sdf'] = torch.sum(q_grad, dim=1)  # B x 14
             rvals['grad_env_sdf'] = torch.sum(q_env_grad, dim=1)  # B x 14
             rvals['closest_pt_world'] = torch.sum(h[:, :, None] * closest_pts_world, dim=1)  # B x 3
             rvals['closest_pt_q_grad'] = dclosest_dq  # B x 3 x 14
+            rvals['closest_pt_env_q_grad'] = dclosest_denv_q
 
             ## alternative to doing this, we instead recompute contact jacobian and hessian at the closest point?
             rvals['contact_jacobian'] = torch.sum(h[:, :, None, None] * rob_jacobian, dim=1)  # B x 3 x 16
@@ -477,7 +483,8 @@ class RobotScene:
 
     def _collision_check_against_robot_sdf_per_link(self, q: torch.Tensor, env_q: torch.Tensor,
                                                     sdf: model_to_sdf.RobotSDF, compute_gradient=False,
-                                                    compute_hessian=False):
+                                                    compute_hessian=False,
+                                                    compute_closest_obj_point=False):
         # This is a function for collision checking when the environment is itself a RobotSDF, i.e. it is
         # an articulated SDF with configuration env_q, vs the robot which has configuration rob_q
         # Add leading batch dimension
@@ -537,7 +544,7 @@ class RobotScene:
 
             # closest points in world frame
             closest_pts_world = pts_world.reshape(BN, -1, 3)[B_range, closest_indices]
-
+        
             # closest points in scene frame
             closest_pts_scene = pts.reshape(BN, -1, 3)[B_range, closest_indices].reshape(-1, 3)
 
@@ -594,13 +601,23 @@ class RobotScene:
             dclosest_dq = (rob_jac_expanded @ closest_pts_grad.unsqueeze(-1)).squeeze(-1)
             dclosest_dq = torch.sum(dclosest_dq, dim=2)
 
+            env_jac_expanded = env_jacobian.transpose(2, 3).unsqueeze(1).expand(BN, 3, self.grad_smooth_points, -1, 3)
+            dclosest_denv_q = (env_jac_expanded @ closest_pts_grad.unsqueeze(-1)).squeeze(-1)
+            dclosest_denv_q = torch.sum(dclosest_denv_q, dim=2)
+
             q_grad = (rob_jacobian.transpose(2, 3) @ sdf_grad_world_frame.unsqueeze(-1)).squeeze(-1)
             q_env_grad = (env_jacobian.transpose(2, 3) @ -sdf_weighted_grad.unsqueeze(-1)).squeeze(-1)
 
             rvals['grad_sdf'] = torch.sum(q_grad, dim=1)  # B x 14
             rvals['grad_env_sdf'] = torch.sum(q_env_grad, dim=1)  # B x 14
             rvals['closest_pt_world'] = torch.sum(h[:, :, None] * closest_pts_world, dim=1)  # B x 3
+            rvals['closest_rob_pt_scene_frame'] = torch.sum(h[:, :, None] * closest_pts_scene.reshape(closest_pts_world.shape), dim=1)  # B x 3
+            if compute_closest_obj_point:
+                res = sdf.object_frame_closest_point(rvals['closest_rob_pt_scene_frame'])
+                rvals['closest_obj_pt_scene_frame'] = res.closest     
+
             rvals['closest_pt_q_grad'] = dclosest_dq  # B x 3 x 14
+            rvals['closest_pt_env_q_grad'] = dclosest_denv_q
 
             ## alternative to doing this, we instead recompute contact jacobian and hessian at the closest point?
             rvals['contact_jacobian'] = torch.sum(h[:, :, None, None] * rob_jacobian, dim=1)  # B x 3 x 16
@@ -669,7 +686,8 @@ class RobotScene:
         return rvals
 
     def scene_collision_check(self, q: torch.Tensor, env_q=None,
-                              compute_gradient=False, compute_hessian=False):
+                              compute_gradient=False, compute_hessian=False,
+                              compute_closest_obj_point=False):
         """
            Collision checks robot with scene sdf
            :param q: torch.Tensor B x dq joint angles
@@ -680,7 +698,7 @@ class RobotScene:
             if env_q is None:
                 raise ValueError('Must provide environment configuration if scene is articulated SDF')
             return self._collision_check_against_robot_sdf_per_link(q, env_q, self.scene_sdf, compute_gradient,
-                                                                    compute_hessian)
+                                                                    compute_hessian,compute_closest_obj_point)
 
         return self._collision_check(q, self.scene_sdf, compute_gradient, compute_hessian)
 

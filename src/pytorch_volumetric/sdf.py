@@ -437,6 +437,30 @@ class BoxSDF(ObjectFrameSDF):
         new_sdf_val, new_sdf_grad = self(new_points)
 
         return new_points, new_sdf_grad
+    
+    @tensor_utils.handle_batch_input(n=2)
+    def _do_object_frame_closest_point(self, points, compute_normal=False,):
+        points = points.to(self.extents.device)
+        extents = self.extents
+        
+        closest_points = torch.clamp(points, -extents, extents)
+        distances = torch.norm(points - closest_points, dim=-1)
+        
+        normals = None
+        if compute_normal:
+            diff = points - closest_points
+            normals = torch.zeros_like(points)
+            mask = torch.any(diff != 0, dim=1)
+            if mask.any():
+                abs_diff = torch.abs(diff[mask])
+                max_dim = torch.argmax(abs_diff, dim=1)
+                normals[mask, max_dim] = torch.sign(diff[mask, max_dim])
+                
+        return closest_points, distances, None, normals, None
+    
+    def object_frame_closest_point(self, points_in_object_frame, compute_normal=False,):
+        return SDFQuery(*self._do_object_frame_closest_point(points_in_object_frame,
+                                                        compute_normal=compute_normal))
 
 
 class CylinderSDF(ObjectFrameSDF):
@@ -602,6 +626,91 @@ class CylinderSDF(ObjectFrameSDF):
 
         return new_points, new_sdf_grad
 
+    @tensor_utils.handle_batch_input(n=2)
+    def _do_object_frame_closest_point(self, points, compute_normal=False):
+        """Compute closest points and distances on cylinder surface.
+        
+        Args:
+            points: Query points tensor (N,3) 
+            compute_normal: Whether to compute surface normals
+            
+        Returns:
+            tuple:
+                - closest_points: Points on surface (N,3)
+                - distances: Distances to surface (N,)
+                - gradient: SDF gradient (None)
+                - normals: Surface normals (N,3) if compute_normal=True, else None
+                - hessian: SDF hessian (None) 
+        """
+        points = points.to(self.device)
+        
+        # Extract xy coordinates and z coordinate
+        xy = points[..., :2]
+        z = points[..., 2]
+        
+        # Get distance from z-axis
+        r = torch.norm(xy, dim=-1)
+        
+        # Handle points on z-axis 
+        on_axis = r < 1e-6
+        r = torch.where(on_axis, torch.ones_like(r), r)
+        
+        # Normalized direction from axis to point in xy plane
+        xy_dir = torch.where(on_axis.unsqueeze(-1),
+                            torch.tensor([1.0, 0.0], device=self.device),
+                            xy / r.unsqueeze(-1))
+        
+        # Clamp z coordinate to cylinder height
+        z_clamped = torch.clamp(z, -self.l, self.l)
+        
+        # Points in each region
+        side_region = (z >= -self.l) & (z <= self.l)
+        above = z > self.l 
+        below = z < -self.l
+        
+        # Compute closest points
+        closest_points = torch.zeros_like(points)
+        
+        r_ = r.unsqueeze(-1)
+
+        # Side surface points
+        closest_points[side_region, :2] = (r_ * xy_dir)[side_region]
+        closest_points[side_region, 2] = z[side_region]
+        
+        # Top cap points
+        closest_points[above, :2] = (r_ * xy_dir)[above] 
+        closest_points[above, 2] = self.l
+        
+        # Bottom cap points
+        closest_points[below, :2] = (r_ * xy_dir)[below]
+        closest_points[below, 2] = -self.l
+        
+        # Compute distances
+        distances = torch.norm(points - closest_points, dim=-1)
+        
+        # Handle inside/outside
+        inside = (r <= self.r) & (z >= -self.l) & (z <= self.l)
+        distances[inside] *= -1
+        
+        # Compute normals if requested
+        normals = None
+        if compute_normal:
+            normals = torch.zeros_like(points)
+            
+            # Side normals point outward radially
+            normals[side_region, :2] = xy_dir[side_region]
+            normals[side_region, 2] = 0
+            
+            # Cap normals point up/down
+            normals[above, 2] = 1
+            normals[below, 2] = -1
+            
+        return closest_points, distances, None, normals, None
+
+    def object_frame_closest_point(self, points_in_object_frame, compute_normal=False,):
+        return SDFQuery(*self._do_object_frame_closest_point(points_in_object_frame,
+                                                        compute_normal=compute_normal))
+
 
 class SphereSDF(ObjectFrameSDF):
 
@@ -647,6 +756,32 @@ class SphereSDF(ObjectFrameSDF):
         points = points / torch.linalg.norm(points, dim=-1, keepdim=True) * self.radius
         # normals are just the unit norm vectors in same direction as vector to points
         return points, points / self.radius
+
+    @tensor_utils.handle_batch_input(n=2)
+    def _do_object_frame_closest_point(self, points, compute_normal=False,):
+        """Compute closest points and distances on cylinder surface."""
+        points = points.to(self.radius.device)
+        radius = self.radius
+        
+        norms = torch.norm(points, dim=1, keepdim=True)
+        mask = norms > 0
+        
+        closest_points = torch.zeros_like(points)
+        if mask.any():
+            closest_points[mask] = points[mask] * (radius / norms[mask])
+        
+        distances = torch.abs(norms.squeeze(-1) - radius)
+        
+        normals = None    
+        if compute_normal:
+            normals = torch.zeros_like(points)
+            normals[mask] = points[mask] / norms[mask]
+            
+        return closest_points, distances, None, normals, None
+
+    def object_frame_closest_point(self, points_in_object_frame, compute_normal=False,):
+        return SDFQuery(*self._do_object_frame_closest_point(points_in_object_frame,
+                                                        compute_normal=compute_normal))
 
 
 class DeepSDF(ObjectFrameSDF):
@@ -830,6 +965,40 @@ class ComposedSDF(ObjectFrameSDF):
         # but that is not a great approximation for the volume of the object
         # TODO: not needed right now, user can manually do it by sampling from each SDF
         raise NotImplementedError()
+
+    def object_frame_closest_point(self, points_in_composed_frame, compute_normal=False):
+        # Loop through each SDF and compute closest point. Make sure to handle transforms from composed frame to individual frame
+        closest_points = []
+        normals = []
+        distances = []
+        for i, sdf in enumerate(self.sdfs):
+            tsf = self.link_frame_to_obj_frame[i]
+            closest, distance, _, normal, _ = sdf.object_frame_closest_point(tsf.inverse().transform_points(points_in_composed_frame),
+                                                                       compute_normal=compute_normal)
+            closest_points.append(tsf.transform_points(closest))
+            if compute_normal:
+                normals.append(tsf.transform_normals(normal))
+            distances.append(distance)
+
+        closest_points = torch.stack(closest_points)
+
+
+        if compute_normal:
+            normals = torch.stack(normals)
+        distances = torch.stack(distances)
+
+        # From (num_sdfs, num_fingers, 3) tensor, pick the closest one for each finger
+        closest_idx = torch.argmin(distances, dim=0)
+        # Pick the closest point using torch.gather and closest_idx
+        closest_points = closest_points[closest_idx, torch.arange(3)]
+
+        if compute_normal:
+            normals = normals[closest_idx]
+        else:
+            normals = None
+        distances = distances.gather(0, closest_idx.unsqueeze(0))
+
+        return SDFQuery(closest_points, distances, None, normals, None)
 
 
 class CachedSDF(ObjectFrameSDF):

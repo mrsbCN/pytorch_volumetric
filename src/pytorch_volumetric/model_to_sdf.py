@@ -165,6 +165,9 @@ class RobotSDF(sdf.ObjectFrameSDF):
 
     def get_mesh_list(self):
         return self.sdf.get_mesh_list()
+    
+    def object_frame_closest_point(self, points_in_composed_frame, compute_normal=False):
+        return self.sdf.object_frame_closest_point(points_in_composed_frame, compute_normal)
 
 
 def cache_link_sdf_factory(resolution=0.01, padding=0.1, **kwargs):
