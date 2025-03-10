@@ -17,6 +17,7 @@ class RobotScene:
     def __init__(self, robot_sdf: model_to_sdf.RobotSDF, scene_sdf: sdf.ObjectFrameSDF, scene_transform: pk.Transform3d,
                  threshold: float = 0.002, points_per_link: int = 100, softmin_temp: float = 1000,
                  collision_check_links: typing.List[str] = None, partial_patch=False,
+                 links_per_finger=1
                  ):
         """
         :param robot_sdf: the robot sdf
@@ -54,6 +55,8 @@ class RobotScene:
         self.transform_points_to_world = vmap(self._transform_pts_to_world)
         self.grad_smooth_points = 50
         self.grad_points = vmap(jacrev(self._transform_points))
+
+        self.links_per_finger = links_per_finger
         # self.hess_points = vmap(jacfwd(jacrev(self._transform_points)))
 
     def _get_desired_tfs(self):
@@ -276,7 +279,16 @@ class RobotScene:
                 rvals['closest_pt_q_grad'] = dclosest_dq  # B x 3 x 14
 
                 ## alternative to doing this, we instead recompute contact jacobian and hessian at the closest point?
-                rvals['contact_jacobian'] = torch.sum(h[:, :, None, None] * pts_jacobian, dim=1)  # B x 3 x 16
+                # Recompute jac and hess at the closest point
+                if not compute_hessian:
+                    pts_jacobian = self.robot_sdf.chain.jacobian(q, locations=rvals['closest_pt_world'],
+                                                                 link_indices=rvals['closest_link'])
+                else:
+                    pts_jacobian, pts_hessian = self.robot_sdf.chain.jacobian_and_hessian(q, locations=rvals['closest_pt_world'],
+                                                                                          link_indices=rvals['closest_link'])
+                    pts_hessian = pts_hessian[:, :3].reshape(B, 3, 3, q.shape[1], q.shape[1])
+                rvals['contact_jacobian'] = pts_jacobian
+                # rvals['contact_jacobian'] = torch.sum(h[:, :, None, None] * pts_jacobian, dim=1)  # B x 3 x 16
                 ## now want to get the contact hessian dJ/dq
                 # rvals['contact_hessian'] = torch.sum(h[:, :, None, None, None] * pts_hessian, dim=1)  # B x 3 x 14 x 14
 
@@ -493,7 +505,7 @@ class RobotScene:
             B = 1
         else:
             B = q.shape[0]
-        num_links = len(self.desired_links)
+        num_fingers = len(self.desired_links) // self.links_per_finger
 
         if compute_hessian and not compute_gradient:
             raise ValueError('Cannot compute hessian without gradient')
@@ -502,7 +514,7 @@ class RobotScene:
         sdf.set_joint_configuration(env_q)
         pts_world = self.transform_to_world(q)
         pts = self.transform_world_to_scene(pts_world)
-
+        robot_frame_indices = self.desired_frame_idx[None, :, None].repeat(B, 1, self.points_per_link).reshape(B, num_fingers, -1)
         sdf_result = sdf(pts, return_extra_info=True)
         sdf_vals = sdf_result['sdf_val']
         sdf_grads = sdf_result['sdf_grad']
@@ -511,23 +523,23 @@ class RobotScene:
         # get the index for the closest frame in the environment robotSDF
         sdf_closest_link = sdf_result['closest_sdf']
         sdf_frame_indices = sdf.sdf_index_to_frame_index[sdf_closest_link]
-        sdf_frame_indices = sdf_frame_indices.reshape(B, num_links, -1)
-        sdf_hess = sdf_hess.reshape(B, num_links, -1, 3, 3)
+        sdf_frame_indices = sdf_frame_indices.reshape(B, num_fingers, -1)
+        sdf_hess = sdf_hess.reshape(B, num_fingers, -1, 3, 3)
 
         # get minimum links
-        sdf_vals = sdf_vals.reshape(B, num_links, -1)
-        sdf_grads = sdf_grads.reshape(B, num_links, -1, 3)
+        sdf_vals = sdf_vals.reshape(B, num_fingers, -1)
+        sdf_grads = sdf_grads.reshape(B, num_fingers, -1, 3)
         sdf_indices = torch.argsort(sdf_vals, dim=-1, descending=False)
-        #sdf_val = sdf_vals[torch.arange(B*), torch.arange(num_links), sdf_indices[:, :, 0]]
+        #sdf_val = sdf_vals[torch.arange(B*), torch.arange(num_fingers), sdf_indices[:, :, 0]]
 
-        sdf_val = sdf_vals.reshape(B*num_links, -1)[torch.arange(B*num_links), sdf_indices.reshape(B*num_links, -1)[:, 0]]
+        sdf_val = sdf_vals.reshape(B*num_fingers, -1)[torch.arange(B*num_fingers), sdf_indices.reshape(B*num_fingers, -1)[:, 0]]
         rvals = {
             'sdf': sdf_val,
         }
         if compute_gradient:
             # rather than take a single point we use the softmin to get a weighted average of the gradients for
             # the self.grad_smooth_points number of closest points, this helps smooth the gradient
-            BN = B*num_links
+            BN = B*num_fingers
             B_range = torch.arange(BN).unsqueeze(-1)
             closest_indices = sdf_indices[:, :, :self.grad_smooth_points].reshape(BN, self.grad_smooth_points)
             closest_sdf_grads = sdf_grads.reshape(BN, -1, 3)[B_range, closest_indices]
@@ -548,12 +560,13 @@ class RobotScene:
             # closest points in scene frame
             closest_pts_scene = pts.reshape(BN, -1, 3)[B_range, closest_indices].reshape(-1, 3)
 
-            closest_links = self.desired_frame_idx[closest_indices // self.points_per_link].reshape(-1)
-            closest_links = self.desired_frame_idx[None, :, None].repeat(B, 1, self.grad_smooth_points).reshape(-1)
-            q_repeat = q[:, None, None, :].repeat(1, num_links, self.grad_smooth_points, 1)
+            # closest_links = self.desired_frame_idx[closest_indices // (self.points_per_link * 2)].reshape(-1)
+            # closest_links = self.desired_frame_idx[None, :, None].repeat(B, 1, self.grad_smooth_points).reshape(-1)
+            closest_links = torch.gather(robot_frame_indices, 2, closest_indices.reshape(B, -1, self.grad_smooth_points)).reshape(-1)
+            q_repeat = q[:, None, None, :].repeat(1, num_fingers, self.grad_smooth_points, 1)
             q_repeat = q_repeat.reshape(BN * self.grad_smooth_points, -1)
 
-            env_q_repeat = env_q[:, None, None, :].repeat(1, num_links,
+            env_q_repeat = env_q[:, None, None, :].repeat(1, num_fingers,
                                                           self.grad_smooth_points,
                                                           1).reshape(BN * self.grad_smooth_points,-1)
 
@@ -681,7 +694,7 @@ class RobotScene:
             rvals['hess_env_sdf'] = torch.sum(q_env_hess, dim=1)
 
         for key, item in rvals.items():
-            rvals[key] = item.reshape(B, num_links, *item.shape[1:])
+            rvals[key] = item.reshape(B, num_fingers, *item.shape[1:])
 
         return rvals
 

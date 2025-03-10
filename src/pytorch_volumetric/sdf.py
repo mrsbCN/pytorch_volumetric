@@ -990,7 +990,7 @@ class ComposedSDF(ObjectFrameSDF):
         # From (num_sdfs, num_fingers, 3) tensor, pick the closest one for each finger
         closest_idx = torch.argmin(distances, dim=0)
         # Pick the closest point using torch.gather and closest_idx
-        closest_points = closest_points[closest_idx, torch.arange(3)]
+        closest_points = closest_points[closest_idx, torch.arange(closest_idx.shape[0])]
 
         if compute_normal:
             normals = normals[closest_idx]
