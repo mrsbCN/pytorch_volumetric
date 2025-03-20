@@ -3,12 +3,13 @@ import enum
 import math
 import os
 import typing
-from typing import NamedTuple, Union
+from typing import Any, NamedTuple, Union
 
 import numpy as np
 import open3d as o3d
 
 import torch
+from torch.autograd import Function
 from arm_pytorch_utilities import tensor_utils, rand
 from multidim_indexing import torch_view
 from functools import partial
@@ -58,7 +59,7 @@ class ObjectFactory(abc.ABC):
         return partial(self.__class__, scale=self.scale, vis_frame_pos=self.vis_frame_pos,
                        vis_frame_rot=self.vis_frame_rot,
                        plausible_suboptimality=self.plausible_suboptimality, **self.other_load_kwargs), \
-            (self.name,)
+               (self.name,)
 
     @abc.abstractmethod
     def make_collision_obj(self, z, rgba=None):
@@ -202,7 +203,7 @@ class MeshObjectFactory(ObjectFactory):
         return partial(self.__class__, path_prefix=self.path_prefix, scale=self.scale, vis_frame_pos=self.vis_frame_pos,
                        vis_frame_rot=self.vis_frame_rot,
                        plausible_suboptimality=self.plausible_suboptimality, **self.other_load_kwargs), \
-            (self.name,)
+               (self.name,)
 
     def make_collision_obj(self, z, rgba=None):
         return None, None
@@ -214,7 +215,8 @@ class MeshObjectFactory(ObjectFactory):
         return os.path.join(self.path_prefix, mesh_path)
 
 
-class ObjectFrameSDF(abc.ABC):
+class ObjectFrameSDF(Function):
+
     @abc.abstractmethod
     def __call__(self, points_in_object_frame):
         """
@@ -223,6 +225,15 @@ class ObjectFrameSDF(abc.ABC):
         :return: tuple of B x N signed distance from closest object surface in m and B x N x d SDF gradient pointing
             towards higher SDF values (away from surface when outside the object and towards the surface when inside)
         """
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Any) -> Any:
+        # only have d(sdf_vals)/d(points_in_object_frame) = sdf_grad, others should be None
+        sdf_grad, = ctx.saved_tensors
+        dsdf_vals_dpoints_in_object_frame = grad_outputs[0].unsqueeze(-1) * sdf_grad
+        outputs = [None for _ in range(ctx.num_inputs)]
+        outputs[0] = dsdf_vals_dpoints_in_object_frame
+        return tuple(outputs)
 
     @abc.abstractmethod
     def surface_bounding_box(self, padding=0., padding_ratio=0.):
@@ -289,9 +300,16 @@ class SphereSDF(ObjectFrameSDF):
         self.radius = radius
 
     def __call__(self, points_in_object_frame):
+        return self.apply(points_in_object_frame, self.radius)
+
+    @staticmethod
+    def forward(ctx, points_in_object_frame, radius):
         dist_to_origin = torch.linalg.norm(points_in_object_frame, dim=-1)
-        dist = dist_to_origin - self.radius
+        dist = dist_to_origin - radius
         grad = points_in_object_frame / (dist_to_origin.unsqueeze(-1) + 1e-12)
+
+        ctx.save_for_backward(grad)
+        ctx.num_inputs = 2
         return dist, grad
 
     def surface_bounding_box(self, padding=0., padding_ratio=0.):
@@ -310,27 +328,33 @@ class MeshSDF(ObjectFrameSDF):
         return torch.tensor(self.obj_factory.bounding_box(**kwargs))
 
     def __call__(self, points_in_object_frame):
+        return self.apply(points_in_object_frame, self.obj_factory, self.vis)
+
+    @staticmethod
+    def forward(ctx, points_in_object_frame, obj_factory, vis=None):
         N, d = points_in_object_frame.shape[-2:]
 
         # compute SDF value for new sampled points
-        res = self.obj_factory.object_frame_closest_point(points_in_object_frame)
+        res = obj_factory.object_frame_closest_point(points_in_object_frame)
+        ctx.save_for_backward(res.gradient)
+        ctx.num_inputs = 3
 
         # points are transformed to link frame, thus it needs to compare against the object in link frame
         # objId is not in link frame and shouldn't be moved
-        if self.vis is not None:
+        if vis is not None:
             for i in range(N):
-                self.vis.draw_point("test_point", points_in_object_frame[..., i, :], color=(1, 0, 0), length=0.005)
-                self.vis.draw_2d_line(f"test_grad", points_in_object_frame[..., i, :],
-                                      res.gradient[..., i, :].detach().cpu(), color=(0, 0, 0),
-                                      size=2., scale=0.03)
-                self.vis.draw_point("test_point_surf", res.closest[..., i, :].detach().cpu(), color=(0, 1, 0),
-                                    length=0.005,
-                                    label=f'{res.distance[..., i].item():.5f}')
+                vis.draw_point("test_point", points_in_object_frame[..., i, :], color=(1, 0, 0), length=0.005)
+                vis.draw_2d_line(f"test_grad", points_in_object_frame[..., i, :],
+                                 res.gradient[..., i, :].detach().cpu(), color=(0, 0, 0),
+                                 size=2., scale=0.03)
+                vis.draw_point("test_point_surf", res.closest[..., i, :].detach().cpu(), color=(0, 1, 0),
+                               length=0.005,
+                               label=f'{res.distance[..., i].item():.5f}')
         return res.distance, res.gradient
 
 
 class ComposedSDF(ObjectFrameSDF):
-    def __init__(self, sdfs: typing.Sequence[ObjectFrameSDF], obj_frame_to_each_frame: pk.Transform3d):
+    def __init__(self, sdfs: typing.Sequence[ObjectFrameSDF], obj_frame_to_each_frame: pk.Transform3d = None):
         """
 
         :param sdfs: S Object frame SDFs
@@ -390,23 +414,28 @@ class ComposedSDF(ObjectFrameSDF):
             return slice(i * total_to_slice, (i + 1) * total_to_slice)
 
     def __call__(self, points_in_object_frame):
+        return self.apply(points_in_object_frame, self.sdfs, self.obj_frame_to_link_frame, self.tsf_batch,
+                          self.link_frame_to_obj_frame)
+
+    @staticmethod
+    def forward(ctx, points_in_object_frame, sdfs, obj_frame_to_link_frame, tsf_batch, link_frame_to_obj_frame):
         pts_shape = points_in_object_frame.shape
         # flatten it for the transform
         points_in_object_frame = points_in_object_frame.view(-1, 3)
         flat_shape = points_in_object_frame.shape
-        S = len(self.sdfs)
+        S = len(sdfs)
         # pts[i] are now points in the ith SDF's frame
-        pts = self.obj_frame_to_link_frame.transform_points(points_in_object_frame)
+        pts = obj_frame_to_link_frame.transform_points(points_in_object_frame)
         # S x B x N x 3
-        if self.tsf_batch is not None:
-            pts = pts.reshape(S, *self.tsf_batch, *flat_shape)
+        if tsf_batch is not None:
+            pts = pts.reshape(S, *tsf_batch, *flat_shape)
         sdfv = []
         sdfg = []
-        for i, sdf in enumerate(self.sdfs):
+        for i, sdf in enumerate(sdfs):
             # B x N for v and B x N x 3 for g
             v, g = sdf(pts[i])
             # need to transform the gradient back to the object frame
-            g = self.link_frame_to_obj_frame[i].transform_normals(g)
+            g = link_frame_to_obj_frame[i].transform_normals(g)
             sdfv.append(v)
             sdfg.append(g)
 
@@ -425,11 +454,13 @@ class ComposedSDF(ObjectFrameSDF):
         vv = v[closest, all]
         gg = g[closest, all]
 
-        if self.tsf_batch is not None:
+        if tsf_batch is not None:
             # retrieve the original query points batch dimensions - note that they are after configuration batch
-            vv = vv.reshape(*self.tsf_batch, *pts_shape[:-1])
-            gg = gg.reshape(*self.tsf_batch, *pts_shape[:-1], 3)
+            vv = vv.reshape(*tsf_batch, *pts_shape[:-1])
+            gg = gg.reshape(*tsf_batch, *pts_shape[:-1], 3)
 
+        ctx.save_for_backward(gg)
+        ctx.num_inputs = 5
         return vv, gg
 
 
@@ -533,33 +564,38 @@ class CachedSDF(ObjectFrameSDF):
         return sdf_val
 
     def __call__(self, points_in_object_frame):
-        # check when points are out of cached range and use ground truth sdf for both value and grad
-        keys = self.voxels.ensure_index_key(points_in_object_frame)
-        keys_ravelled = self.voxels.ravel_multi_index(keys, self.voxels.shape)
+        return self.apply(points_in_object_frame, self.voxels, self.voxels_grad, self.bb, self.out_of_bounds_strategy,
+                          self.device, self.gt_sdf)
 
-        inbound_keys = self.voxels.get_valid_values(points_in_object_frame)
+    @staticmethod
+    def forward(ctx, points_in_object_frame, voxels, voxels_grad, bb, out_of_bounds_strategy, device, gt_sdf):
+        # check when points are out of cached range and use ground truth sdf for both value and grad
+        keys = voxels.ensure_index_key(points_in_object_frame)
+        keys_ravelled = voxels.ravel_multi_index(keys, voxels.shape)
+
+        inbound_keys = voxels.get_valid_values(points_in_object_frame)
         out_of_bound_keys = ~inbound_keys
 
         # logger.info(f"out of bound keys: {out_of_bound_keys.sum()}/{out_of_bound_keys.numel()}")
 
         dtype = points_in_object_frame.dtype
-        val = torch.zeros(keys_ravelled.shape, device=self.device, dtype=dtype)
-        grad = torch.zeros(keys.shape, device=self.device, dtype=dtype)
+        val = torch.zeros(keys_ravelled.shape, device=device, dtype=dtype)
+        grad = torch.zeros(keys.shape, device=device, dtype=dtype)
 
-        val[inbound_keys] = self.voxels.raw_data[keys_ravelled[inbound_keys]]
-        grad[inbound_keys] = self.voxels_grad[keys_ravelled[inbound_keys]]
+        val[inbound_keys] = voxels.raw_data[keys_ravelled[inbound_keys]]
+        grad[inbound_keys] = voxels_grad[keys_ravelled[inbound_keys]]
 
         points_oob = points_in_object_frame[out_of_bound_keys]
-        if self.out_of_bounds_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
-            val[out_of_bound_keys], grad[out_of_bound_keys] = self.gt_sdf(points_oob)
-        elif self.out_of_bounds_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
-            if self.bb.dtype != dtype:
-                self.bb = self.bb.to(dtype=dtype)
+        if out_of_bounds_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
+            val[out_of_bound_keys], grad[out_of_bound_keys] = gt_sdf(points_oob)
+        elif out_of_bounds_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
+            if bb.dtype != dtype:
+                bb = bb.to(dtype=dtype)
             # distance to bounding box
-            dmin = self.bb[:, 0] - points_oob
+            dmin = bb[:, 0] - points_oob
             dmin_active = dmin > 0
             dmin[~dmin_active] = 0
-            dmax = points_oob - self.bb[:, 1]
+            dmax = points_oob - bb[:, 1]
             dmax_active = dmax > 0
             dmax[~dmax_active] = 0
             dtotal = dmin + dmax
@@ -570,24 +606,26 @@ class CachedSDF(ObjectFrameSDF):
             grad[out_of_bound_keys] = dtotal / dist.unsqueeze(-1)
             val[out_of_bound_keys] = dist
 
-            # comparison with ground truth
-            if self.debug_check_sdf:
-                val_gt, grad_gt = self.gt_sdf(points_oob)
-                diff = val_gt - val[out_of_bound_keys]
-                # always under-approximate the SDF value
-                assert torch.all(diff > 0)
-                # cosine similarity to compare the gradient vectors
-                diff_grad = torch.cosine_similarity(grad_gt, grad[out_of_bound_keys], dim=-1)
-                assert torch.all(diff_grad > 0.7)
-                assert diff_grad.mean() > 0.95
+            # # comparison with ground truth
+            # if self.debug_check_sdf:
+            #     val_gt, grad_gt = self.gt_sdf(points_oob)
+            #     diff = val_gt - val[out_of_bound_keys]
+            #     # always under-approximate the SDF value
+            #     assert torch.all(diff > 0)
+            #     # cosine similarity to compare the gradient vectors
+            #     diff_grad = torch.cosine_similarity(grad_gt, grad[out_of_bound_keys], dim=-1)
+            #     assert torch.all(diff_grad > 0.7)
+            #     assert diff_grad.mean() > 0.95
 
-        if self.debug_check_sdf:
-            val_gt = self._fallback_sdf_value_func(points_in_object_frame)
-            # the ones that are valid should be close enough to the ground truth
-            diff = torch.abs(val - val_gt)
-            close_enough = diff < self.resolution
-            within_bounds = self.voxels.get_valid_values(points_in_object_frame)
-            assert torch.all(close_enough[within_bounds])
+        # if self.debug_check_sdf:
+        #     val_gt = self._fallback_sdf_value_func(points_in_object_frame)
+        #     # the ones that are valid should be close enough to the ground truth
+        #     diff = torch.abs(val - val_gt)
+        #     close_enough = diff < self.resolution
+        #     within_bounds = self.voxels.get_valid_values(points_in_object_frame)
+        #     assert torch.all(close_enough[within_bounds])
+        ctx.save_for_backward(grad)
+        ctx.num_inputs = 7
         return val, grad
 
     def outside_surface(self, points_in_object_frame, surface_level=0):
