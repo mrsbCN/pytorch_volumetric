@@ -1,4 +1,5 @@
 import os
+import time
 
 import open3d as o3d
 import pytorch_kinematics as pk
@@ -136,7 +137,44 @@ def test_gradients_at_surface_pts():
     do_test_gradients_at_surface_pts("offset_wrench_nogrip.obj")
 
 
+def test_lookup_performance():
+    N = 20000
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+    obj = pv.MeshObjectFactory("YcbPowerDrill/textured_simple_reoriented.obj")
+
+    # sample points in the bounding box
+    coords, orig_pts = pv.get_coordinates_and_points_in_grid(0.002, obj.bounding_box(0.01), device=d)
+
+    for _ in range(10):
+        # randomly downsample to some number of points
+        pts = orig_pts[torch.randperm(len(orig_pts))[:N]]
+        N = len(pts)
+
+        # test with various classes of SDF
+        sdf = pv.MeshSDF(obj)
+        # profile
+        start = time.time()
+        sdf_vals, sdf_grads = sdf(pts)
+        num_hash = sdf_vals.sum()
+        print(f"Time taken for {N} points: {time.time() - start:.4f} s for {d}; hash: {num_hash.item()}")
+
+        cache_sdf = pv.CachedSDF('drill', resolution=0.01, range_per_dim=obj.bounding_box(padding=0.1), gt_sdf=sdf)
+        start = time.time()
+        sdf_vals, sdf_grads = cache_sdf(pts)
+        num_hash = sdf_vals.sum()
+        print(f"Time taken for {N} points: {time.time() - start:.4f} s for {d}; hash: {num_hash.item()} cached")
+
+        pts.requires_grad = True
+        start = time.time()
+        sdf_vals, sdf_grads = sdf(pts)
+        num_hash = sdf_vals.sum()
+        print(
+            f"Time taken for {N} points: {time.time() - start:.4f} s for {d}; hash: {num_hash.detach().item()} with grad")
+        pts.requires_grad = False
+
+
 if __name__ == "__main__":
     test_gradients_at_surface_pts()
     test_compose_sdf()
     test_differentiability()
+    test_lookup_performance()
