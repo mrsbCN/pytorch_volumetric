@@ -17,7 +17,7 @@ class RobotScene:
     def __init__(self, robot_sdf: model_to_sdf.RobotSDF, scene_sdf: sdf.ObjectFrameSDF, scene_transform: pk.Transform3d,
                  threshold: float = 0.002, points_per_link: int = 100, softmin_temp: float = 1000,
                  collision_check_links: typing.List[str] = None, partial_patch=False,
-                 links_per_finger=1
+                 links_per_finger=1, obj_link_name=None
                  ):
         """
         :param robot_sdf: the robot sdf
@@ -56,13 +56,61 @@ class RobotScene:
         self.grad_smooth_points = 50
         self.grad_points = vmap(jacrev(self._transform_points))
 
+        self.transform_grad_world_to_link = vmap(self._transform_grad_world_to_link)
+
+        self.get_specific_tfs = vmap(self._get_specific_tfs)
+
         self.links_per_finger = links_per_finger
+        self.obj_link_name = obj_link_name
         # self.hess_points = vmap(jacfwd(jacrev(self._transform_points)))
+
+    def find_indices_vectorized(self, source_tensor: torch.Tensor, target_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Find indices of elements from source_tensor in target_tensor using vectorized operations.
+        
+        Args:
+            source_tensor: Tensor containing elements to find
+            target_tensor: Tensor to search in
+            
+        Returns:
+            Tensor of indices where elements from source_tensor appear in target_tensor
+            Returns -1 for elements not found
+        """
+        # Reshape tensors for broadcasting
+        source_flat = source_tensor.reshape(-1, 1)
+        target_flat = target_tensor.reshape(1, -1)
+        
+        # Create equality matrix
+        matches = (source_flat == target_flat)
+        
+        # Get first matching index for each source element
+        indices = torch.zeros_like(source_flat, dtype=torch.long)
+        
+        # For each row (source element), find the first True position
+        first_matches = matches.to(torch.int8).argmax(dim=1)
+        
+        # Check if a match was actually found (the argmax will return 0 if no match)
+        found_mask = matches.any(dim=1)
+        
+        # Set indices to -1 where no match was found
+        indices = torch.where(
+            found_mask, 
+            first_matches, 
+            torch.tensor(-1, device=source_tensor.device)
+        )
+        
+        return indices.reshape(source_tensor.shape)
 
     def _get_desired_tfs(self):
         tfs = self.robot_sdf.sdf.obj_frame_to_link_frame.get_matrix().reshape(self.num_links, -1, 4, 4)
         tfs = tfs[self.desired_link_idx].reshape(-1, 4, 4)
         return pk.Transform3d(matrix=tfs)
+    
+    def _get_specific_tfs(self, frame_indices):
+        tfs = self.robot_sdf.sdf.obj_frame_to_link_frame.get_matrix().reshape(self.num_links, -1, 4, 4)
+        indices = self.find_indices_vectorized(frame_indices, self.desired_link_idx)
+        tfs = tfs[indices].reshape(-1, 4, 4)
+        return tfs
 
     def _generate_robot_query_points(self, partial_patch=False):
         query_points = []
@@ -140,6 +188,16 @@ class RobotScene:
     def visualize_robot(self, q: torch.Tensor, env_q: torch.Tensor = None):
         meshes = self.get_visualization_meshes(q, env_q)
         o3d.visualization.draw_geometries(meshes, mesh_show_wireframe=True, width=800, height=600)
+
+    def _transform_grad_world_to_link(self, grads: torch.Tensor):
+        """
+            Transforms robot query points from world frame to link frame
+        :param grads: torch.Tensor B x N x 3 grads in world frame
+        :return:
+        """
+        tfs = self._get_desired_tfs()
+        grads = tfs.transform_normals(grads.reshape(-1, 3))
+        return grads
 
     def _transform_to_world(self, q: torch.Tensor, weight=None):
         """
@@ -496,7 +554,8 @@ class RobotScene:
     def _collision_check_against_robot_sdf_per_link(self, q: torch.Tensor, env_q: torch.Tensor,
                                                     sdf: model_to_sdf.RobotSDF, compute_gradient=False,
                                                     compute_hessian=False,
-                                                    compute_closest_obj_point=False):
+                                                    compute_closest_obj_point=False,
+                                                    rob_link_idx=None):
         # This is a function for collision checking when the environment is itself a RobotSDF, i.e. it is
         # an articulated SDF with configuration env_q, vs the robot which has configuration rob_q
         # Add leading batch dimension
@@ -562,7 +621,8 @@ class RobotScene:
 
             # closest_links = self.desired_frame_idx[closest_indices // (self.points_per_link * 2)].reshape(-1)
             # closest_links = self.desired_frame_idx[None, :, None].repeat(B, 1, self.grad_smooth_points).reshape(-1)
-            closest_links = torch.gather(robot_frame_indices, 2, closest_indices.reshape(B, -1, self.grad_smooth_points)).reshape(-1)
+            closest_links_not_flat = torch.gather(robot_frame_indices, 2, closest_indices.reshape(B, -1, self.grad_smooth_points))
+            closest_links = closest_links_not_flat.reshape(-1)
             q_repeat = q[:, None, None, :].repeat(1, num_fingers, self.grad_smooth_points, 1)
             q_repeat = q_repeat.reshape(BN * self.grad_smooth_points, -1)
 
@@ -624,13 +684,63 @@ class RobotScene:
             rvals['grad_sdf'] = torch.sum(q_grad, dim=1)  # B x 14
             rvals['grad_env_sdf'] = torch.sum(q_env_grad, dim=1)  # B x 14
             rvals['closest_pt_world'] = torch.sum(h[:, :, None] * closest_pts_world, dim=1)  # B x 3
-            rvals['closest_rob_pt_scene_frame'] = torch.sum(h[:, :, None] * closest_pts_scene.reshape(closest_pts_world.shape), dim=1)  # B x 3
-            if compute_closest_obj_point:
-                res = sdf.object_frame_closest_point(rvals['closest_rob_pt_scene_frame'])
-                rvals['closest_obj_pt_scene_frame'] = res.closest     
+            rvals['closest_rob_pt_scene'] = torch.sum(h[:, :, None] * closest_pts_scene.reshape(closest_pts_world.shape), dim=1)  # B x 3
+
 
             rvals['closest_pt_q_grad'] = dclosest_dq  # B x 3 x 14
             rvals['closest_pt_env_q_grad'] = dclosest_denv_q
+            # Transform dclosest_dq to the scene frame
+            rvals['closest_pt_q_grad_scene'] = self.scene_transform.inverse().transform_normals(
+                dclosest_dq.transpose(1, 2).reshape(-1, 3)
+            ).reshape(BN, -1, 3).transpose(1, 2)
+            rvals['closest_pt_env_q_grad_scene'] = self.scene_transform.inverse().transform_normals(
+                dclosest_denv_q.transpose(1, 2).reshape(-1, 3)
+            ).reshape(BN, -1, 3).transpose(1, 2)
+
+            env_q_for_transform = env_q.clone()
+            # Ignore screwdriver yaw
+            if self.obj_link_name == 'screwdriver_body':
+                env_q_for_transform[:, -2:] = 0.0
+            # Transform dclosest_dq to the object frame
+            object_trans_mat = sdf.chain.forward_kinematics(
+                env_q_for_transform)[self.obj_link_name].inverse().get_matrix()
+            
+            object_trans_mat = object_trans_mat.unsqueeze(1).expand(-1, num_fingers, -1, -1).reshape(BN, 4, 4)
+            object_trans = pk.Transform3d(matrix=object_trans_mat)
+
+            # Convert from scene frame to object frame
+            rvals['closest_rob_pt_object'] = object_trans.transform_points(rvals['closest_rob_pt_scene'].unsqueeze(1)).squeeze(1)
+            rvals['closest_pt_q_grad_object'] = object_trans.transform_normals(
+                rvals['closest_pt_q_grad_scene'].transpose(1, 2)
+            ).reshape(BN, -1, 3).transpose(1, 2)
+            rvals['closest_pt_env_q_grad_object'] = object_trans.transform_normals(
+                rvals['closest_pt_env_q_grad_scene'].transpose(1, 2)
+            ).reshape(BN, -1, 3).transpose(1, 2)
+
+            if self.obj_link_name == 'screwdriver_body':
+                rvals['closest_pt_env_q_grad_object'][..., -2:] = 0.0
+            if compute_closest_obj_point:
+                res = sdf.object_frame_closest_point(rvals['closest_rob_pt_object'])
+                rvals['closest_obj_pt_object'] = res.closest     
+
+            if compute_closest_obj_point or rob_link_idx is not None:
+                
+                if compute_closest_obj_point:
+                    rvals['closest_pt_closest_link'] = closest_links_not_flat[..., 0].flatten()
+                    closest_pt_link_tfs = self.get_specific_tfs(rvals['closest_pt_closest_link'].unsqueeze(0)).squeeze(0)
+                else:
+                    closest_pt_link_tfs = self.get_specific_tfs(rob_link_idx.unsqueeze(0)).reshape(BN, 4, 4)
+                closest_pt_link_tfs = pk.Transform3d(matrix=closest_pt_link_tfs)
+                rvals['closest_rob_pt_link'] = closest_pt_link_tfs.transform_points(
+                    rvals['closest_pt_world'].reshape(BN, -1, 3)
+                ).reshape(BN, 3)  # B x 3
+
+                rvals['closest_pt_q_grad_link'] = closest_pt_link_tfs.transform_normals(
+                    dclosest_dq.transpose(1, 2)
+                ).reshape(BN, -1, 3).transpose(1, 2)
+                rvals['closest_pt_env_q_grad_link'] = closest_pt_link_tfs.transform_normals(
+                    dclosest_denv_q.transpose(1, 2)
+                ).reshape(BN, -1, 3).transpose(1, 2)
 
             ## alternative to doing this, we instead recompute contact jacobian and hessian at the closest point?
             rvals['contact_jacobian'] = torch.sum(h[:, :, None, None] * rob_jacobian, dim=1)  # B x 3 x 16
@@ -700,7 +810,8 @@ class RobotScene:
 
     def scene_collision_check(self, q: torch.Tensor, env_q=None,
                               compute_gradient=False, compute_hessian=False,
-                              compute_closest_obj_point=False):
+                              compute_closest_obj_point=False,
+                              rob_link_idx=None):
         """
            Collision checks robot with scene sdf
            :param q: torch.Tensor B x dq joint angles
@@ -711,7 +822,8 @@ class RobotScene:
             if env_q is None:
                 raise ValueError('Must provide environment configuration if scene is articulated SDF')
             return self._collision_check_against_robot_sdf_per_link(q, env_q, self.scene_sdf, compute_gradient,
-                                                                    compute_hessian,compute_closest_obj_point)
+                                                                    compute_hessian,compute_closest_obj_point,
+                                                                    rob_link_idx)
 
         return self._collision_check(q, self.scene_sdf, compute_gradient, compute_hessian)
 
