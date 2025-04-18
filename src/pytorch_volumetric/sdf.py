@@ -966,18 +966,30 @@ class ComposedSDF(ObjectFrameSDF):
         # TODO: not needed right now, user can manually do it by sampling from each SDF
         raise NotImplementedError()
 
-    def object_frame_closest_point(self, points_in_composed_frame, compute_normal=False):
+    def object_frame_closest_point(self, points_in_composed_frame, compute_normal=False, return_frame=None):
         # Loop through each SDF and compute closest point. Make sure to handle transforms from composed frame to individual frame
         closest_points = []
         normals = []
         distances = []
+        if return_frame is not None:
+            return_frame_transform = self.link_frame_to_obj_frame[return_frame].inverse()
         for i, sdf in enumerate(self.sdfs):
             tsf = self.link_frame_to_obj_frame[i]
             closest, distance, _, normal, _ = sdf.object_frame_closest_point(tsf.inverse().transform_points(points_in_composed_frame),
                                                                        compute_normal=compute_normal)
-            closest_points.append(tsf.transform_points(closest))
+            closest_points_obj = (tsf.transform_points(closest))
+            if return_frame is not None:
+                closest_points_obj = return_frame_transform.transform_points(closest_points_obj)
+            closest_points.append(closest_points_obj)
+            # closest, distance, _, normal, _ = sdf.object_frame_closest_point(points_in_composed_frame,
+            #                                                            compute_normal=compute_normal)
+
+            # closest_points.append((closest))
             if compute_normal:
-                normals.append(tsf.transform_normals(normal))
+                obj_normal = tsf.transform_normals(normal)
+                if return_frame is not None:
+                    obj_normal = return_frame_transform.transform_normals(obj_normal)
+                normals.append(obj_normal)
             distances.append(distance)
 
         closest_points = torch.stack(closest_points)

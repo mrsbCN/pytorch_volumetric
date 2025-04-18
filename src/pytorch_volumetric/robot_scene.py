@@ -702,8 +702,9 @@ class RobotScene:
             if self.obj_link_name == 'screwdriver_body':
                 env_q_for_transform[:, -2:] = 0.0
             # Transform dclosest_dq to the object frame
-            object_trans_mat = sdf.chain.forward_kinematics(
-                env_q_for_transform)[self.obj_link_name].inverse().get_matrix()
+            object_trans_dict = sdf.chain.forward_kinematics(
+                env_q_for_transform)
+            object_trans_mat = object_trans_dict[self.obj_link_name].inverse().get_matrix()
             
             object_trans_mat = object_trans_mat.unsqueeze(1).expand(-1, num_fingers, -1, -1).reshape(BN, 4, 4)
             object_trans = pk.Transform3d(matrix=object_trans_mat)
@@ -720,8 +721,14 @@ class RobotScene:
             if self.obj_link_name == 'screwdriver_body':
                 rvals['closest_pt_env_q_grad_object'][..., -2:] = 0.0
             if compute_closest_obj_point:
-                res = sdf.object_frame_closest_point(rvals['closest_rob_pt_object'])
+                return_frame = 1 if 'cross' in self.obj_link_name else None
+                input_ = rvals['closest_rob_pt_object']
+                if 'cross' in self.obj_link_name:
+                    input_ = rvals['closest_rob_pt_scene']
+                res = sdf.object_frame_closest_point(input_, return_frame=return_frame)
                 rvals['closest_obj_pt_object'] = res.closest     
+                # if 'cross' in self.obj_link_name:
+
 
             if compute_closest_obj_point or rob_link_idx is not None:
                 
