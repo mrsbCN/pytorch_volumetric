@@ -54,7 +54,7 @@ classifiers = [# Optional
 dependencies = [# Optional
     'torch',
     'numpy',
-    'open3d',
+    # 'open3d', # Moved to optional-dependencies
     'arm-pytorch-utilities>=0.4',
     'multidim-indexing',
     'pytorch-kinematics>=0.5.6',
@@ -70,6 +70,7 @@ dependencies = [# Optional
 # projects.
 [project.optional-dependencies] # Optional
 test = ["pytest", "pybullet"]
+vis = ["open3d"]
 
 # List URLs that are relevant to your project
 #

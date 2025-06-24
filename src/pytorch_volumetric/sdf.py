@@ -6,7 +6,11 @@ import typing
 from typing import Any, NamedTuple, Union
 
 import numpy as np
-import open3d as o3d
+try:
+    import open3d as o3d
+except ImportError:
+    print("Warning: open3d not found. Some features in pytorch_volumetric.sdf may be unavailable.")
+    o3d = None
 
 import torch
 from torch.autograd import Function

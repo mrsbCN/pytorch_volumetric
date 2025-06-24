@@ -317,8 +317,12 @@ class Chain:
 
         frame_transforms = {}
         b = th.shape[0]
+        base_identity = self.identity.repeat(b, 1, 1)
+        if th.requires_grad and th.numel() > 0:
+            zero_for_grad = th.sum() * 0.0
+            base_identity = base_identity + zero_for_grad
         for frame_idx in frame_indices:
-            frame_transform = torch.eye(4).to(th).unsqueeze(0).repeat(b, 1, 1)
+            frame_transform = base_identity.clone()
 
             # iterate down the list and compose the transform
             for chain_idx in self.parents_indices[frame_idx.item()]:
