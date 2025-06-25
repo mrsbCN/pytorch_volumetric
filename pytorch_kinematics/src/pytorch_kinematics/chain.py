@@ -337,13 +337,25 @@ class Chain:
         pris_jnt_transform = axis_and_d_to_pris_matrix(axes_expanded, th)
 
         frame_transforms = {}
-        b = th.shape[0]
-        base_identity = self.identity.repeat(b, 1, 1)
-        if th.requires_grad and th.numel() > 0:
-            zero_for_grad = th.sum() * 0.0
-            base_identity = base_identity + zero_for_grad
         for frame_idx in frame_indices:
-            frame_transform = base_identity.clone()
+            # frame_transform is the transformation from the base of the robot to the frame_idx'th frame
+            # Initialize frame_transform for this specific frame_idx to identity.
+            # It needs to be on the same device and dtype as th, and have the correct batch size.
+            # self.identity is (1,4,4). We need (b,4,4)
+            # b is defined outside the loop (b = th.shape[0])
+            current_frame_accumulated_transform = self.identity.repeat(b, 1, 1) # Initialize without clone first
+            if th.requires_grad:
+                if th.numel() > 0: # Check if th is not an empty tensor
+                    # Create a scalar '1.0' that is part of th's computation graph,
+                    # has the same dtype as th, and is on the same device as th.
+                    graph_connected_one = (th.view(-1)[0] - th.view(-1)[0].detach()) + 1.0
+
+                    # Multiply current_frame_accumulated_transform by this graph-connected scalar one.
+                    # This operation links current_frame_accumulated_transform to th's graph
+                    # without changing its numerical values. Scalar broadcasts to (b,4,4).
+                    current_frame_accumulated_transform = current_frame_accumulated_transform * graph_connected_one
+
+            frame_transform = current_frame_accumulated_transform.clone() # Clone after potential modification
 
             # iterate down the list and compose the transform
             for chain_idx in self.parents_indices[frame_idx.item()]:
