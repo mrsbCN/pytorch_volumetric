@@ -8,8 +8,8 @@ import numpy as np
 
 import pytorch_kinematics as pk
 from pytorch_kinematics import MimicChain
-from pytorch_kinematics import RobotVisualizer, visualize_robot_simple, create_joint_trajectory_animation
-
+from pytorch_kinematics import RobotVisualizer, visualize_robot_simple, create_joint_trajectory_animation, create_base_trajectory_animation
+from pytorch_kinematics import transforms as tf
 
 def demo_hand_visualization():
     """演示机械手可视化"""
@@ -99,14 +99,36 @@ def demo_hand_animation():
     try:
         # 加载机械手模型
         mimic_chain = pk.build_mimic_chain_from_urdf(open("hand/schunk_svh_hand_right.urdf", mode="rb").read())
+        # 首先进行base transform
+        base_translation = torch.tensor([0.1, 0.15, -0.1])
+        base_rot = torch.tensor([np.pi * 2, np.pi * 2, np.pi * 2])  # 旋转绕X轴
+        print("生成基座移动和旋转动画轨迹...")
+        n_frames = 50
+        trajectories = []
+        for i in range(n_frames):
+            trans = base_translation * (i / n_frames)
+            rot = base_rot * (i / n_frames)
+            rot_matrix = tf.euler_angles_to_matrix(rot, "XYZ")
+            base_transform_matrix = torch.eye(4)
+            base_transform_matrix[:3, 3] = trans
+            base_transform_matrix[:3, :3] = rot_matrix
+            trajectories.append(base_transform_matrix)
         
+        # 创建动画
+        create_base_trajectory_animation(
+            mimic_chain,
+            trajectories,
+            mesh_path_prefix="hand/",
+            window_name="机械手动画 - 基座",
+            fps=10
+        )
+
         # 获取独立关节数量
         n_independent = len(mimic_chain.get_independent_joint_names())
         
         print(f"生成动画轨迹，独立关节数量: {n_independent}")
         
         # 生成一个简单的轨迹：从张开到闭合
-        n_frames = 50
         trajectories = []
         
         for i in range(n_frames):

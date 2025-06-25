@@ -4,6 +4,7 @@
 
 import numpy as np
 import torch
+import sys
 import open3d as o3d
 from typing import Dict, List, Optional, Union
 import os
@@ -211,6 +212,77 @@ class RobotVisualizer:
         
         return geometries
     
+    
+    def create_scene_geometries_base_trans(self, base_trans_values: Union[torch.Tensor, np.ndarray, dict, list]) -> List[o3d.geometry.Geometry3D]:
+        """
+        基于给定关节值创建场景几何体
+        
+        Args:
+            joint_values: 关节值
+        
+        Returns:
+            几何体列表
+        """
+        self.chain.set_base_transform(base_trans_values)
+
+        # 计算正向运动学
+        n_independent = len(self.chain.get_independent_joint_names())
+        joint_values_zero = torch.zeros(n_independent)
+        transforms_dict = self.chain.forward_kinematics(joint_values_zero, end_only=False)
+        
+        geometries = []
+        
+        # 为每个frame创建几何体
+        for frame_name, transform in transforms_dict.items():
+            frame = self.chain.find_frame(frame_name)
+            if not frame:
+                continue
+            
+            # 获取变换矩阵
+            if hasattr(transform, 'get_matrix'):
+                T = transform.get_matrix().squeeze().cpu().numpy()
+            else:
+                T = transform.squeeze().cpu().numpy()
+            
+            # 添加坐标系
+            coord_frame = self._create_coordinate_frame(size=0.03)
+            coord_frame.transform(T)
+            geometries.append(coord_frame)
+            
+            # 添加关节球体（如果是非固定关节）
+            if frame.joint.joint_type != 'fixed':
+                joint_sphere = self._create_joint_sphere(radius=0.005)
+                joint_sphere.transform(T)
+                geometries.append(joint_sphere)
+            
+            # 添加link几何体
+            link_name = frame.link.name
+            if link_name in self.link_mesh_info:
+                # 有mesh文件
+                for mesh_info in self.link_mesh_info[link_name]:
+                    mesh = self._load_mesh(mesh_info['file'], mesh_info['scale'])
+                    if mesh is not None:
+                        # 应用offset变换
+                        if mesh_info['offset'] is not None:
+                            offset_matrix = mesh_info['offset'].get_matrix().squeeze().cpu().numpy()
+                            mesh.transform(offset_matrix)
+                        
+                        # 应用frame变换
+                        mesh.transform(T)
+                        
+                        # 设置颜色
+                        if not mesh.has_vertex_colors():
+                            mesh.paint_uniform_color([0.8, 0.8, 0.9])  # 淡蓝色
+                        
+                        geometries.append(mesh)
+            else:
+                # 没有mesh，创建简单几何体
+                simple_geom = self._create_simple_link_geometry()
+                simple_geom.transform(T)
+                geometries.append(simple_geom)
+        
+        return geometries
+
     def visualize(self, joint_values: Union[torch.Tensor, np.ndarray, dict, list], 
                   window_name: str = "Robot Visualization",
                   show_coordinate_frames: bool = True,
@@ -252,6 +324,60 @@ class RobotVisualizer:
             height=768
         )
     
+    def create_base_trans_animation(self, base_trans_trajectories: List[Union[torch.Tensor, np.ndarray, dict, list]],
+                        window_name: str = "Robot Animation",
+                        fps: int = 30) -> None:
+        """
+        创建动画可视化
+        
+        Args:
+            joint_trajectories: 关节轨迹列表
+            window_name: 窗口名称
+            fps: 帧率
+        """
+        # 初始化可视化器
+        vis = o3d.visualization.Visualizer()
+        vis.create_window(window_name=window_name, width=1024, height=768)
+        
+        # 添加初始几何体
+        initial_geometries = self.create_scene_geometries_base_trans(base_trans_trajectories[0])
+        geometry_refs = []
+        
+        for geom in initial_geometries:
+            vis.add_geometry(geom)
+            geometry_refs.append(geom)
+        
+        # 设置视角
+        ctr = vis.get_view_control()
+        ctr.set_zoom(0.8)
+        
+        # 动画循环
+        for base_trans_values in base_trans_trajectories:
+            # 更新几何体
+            new_geometries = self.create_scene_geometries_base_trans(base_trans_values)
+            
+            # 更新每个几何体
+            for i, (old_geom, new_geom) in enumerate(zip(geometry_refs, new_geometries)):
+                if i < len(geometry_refs):
+                    # 更新顶点和变换
+                    old_geom.vertices = new_geom.vertices
+                    old_geom.triangles = new_geom.triangles
+                    if new_geom.has_vertex_normals():
+                        old_geom.vertex_normals = new_geom.vertex_normals
+                    if new_geom.has_vertex_colors():
+                        old_geom.vertex_colors = new_geom.vertex_colors
+                    
+                    vis.update_geometry(old_geom)
+            
+            vis.poll_events()
+            vis.update_renderer()
+            
+            # 控制帧率
+            import time
+            time.sleep(1.0 / fps)
+        
+        vis.destroy_window()
+
     def create_animation(self, joint_trajectories: List[Union[torch.Tensor, np.ndarray, dict, list]],
                         window_name: str = "Robot Animation",
                         fps: int = 30) -> None:
@@ -347,6 +473,19 @@ def visualize_robot_simple(chain, joint_values, mesh_path_prefix: str = "", **kw
     """
     visualizer = RobotVisualizer(chain, mesh_path_prefix=mesh_path_prefix)
     visualizer.visualize(joint_values, **kwargs)
+
+def create_base_trajectory_animation(chain, base_trajectories, mesh_path_prefix: str = "", **kwargs):
+    """
+    创建关节轨迹动画
+    
+    Args:
+        chain: pytorch_kinematics Chain对象
+        joint_trajectories: 机器人base坐标轨迹列表
+        mesh_path_prefix: mesh文件路径前缀
+        **kwargs: 传递给create_animation方法的其他参数
+    """
+    visualizer = RobotVisualizer(chain, mesh_path_prefix=mesh_path_prefix)
+    visualizer.create_base_trans_animation(base_trajectories, **kwargs)
 
 
 def create_joint_trajectory_animation(chain, joint_trajectories, mesh_path_prefix: str = "", **kwargs):

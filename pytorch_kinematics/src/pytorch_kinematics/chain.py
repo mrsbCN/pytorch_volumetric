@@ -150,7 +150,7 @@ class Chain:
         if not isinstance(transform_matrix, torch.Tensor):
             raise TypeError(f"transform_matrix must be a torch.Tensor, got {type(transform_matrix)}")
         if transform_matrix.shape != (4, 4):
-            raise ValueError(f"transform_matrix must be of shape (4, 4), got {transform_matrix.shape}")
+            raise ValueError(f"transform_matrix must be of shape (,4, 4), got {transform_matrix.shape}")
 
         self.base_transform = tf.Transform3d(matrix=transform_matrix, device=self.device, dtype=self.dtype)
         # Ensure it's on the correct device/dtype, Transform3d constructor should handle it if matrix is already correct
@@ -337,13 +337,10 @@ class Chain:
         pris_jnt_transform = axis_and_d_to_pris_matrix(axes_expanded, th)
 
         frame_transforms = {}
-        b = th.shape[0]
-        base_identity = self.identity.repeat(b, 1, 1)
-        if th.requires_grad and th.numel() > 0:
-            zero_for_grad = th.sum() * 0.0
-            base_identity = base_identity + zero_for_grad
+
         for frame_idx in frame_indices:
-            frame_transform = base_identity.clone()
+            frame_transform = torch.eye(4).to(th).unsqueeze(0).repeat(b, 1, 1)
+            #frame_transform = base_identity.clone()
 
             # iterate down the list and compose the transform
             for chain_idx in self.parents_indices[frame_idx.item()]:
