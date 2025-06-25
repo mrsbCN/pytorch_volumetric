@@ -75,6 +75,7 @@ class Chain:
         self.device = device
 
         self.identity = torch.eye(4, device=self.device, dtype=self.dtype).unsqueeze(0)
+        self.base_transform = tf.Transform3d(device=self.device, dtype=self.dtype)
 
         low, high = self.get_joint_limits()
         self.low = torch.tensor(low, device=self.device, dtype=self.dtype)
@@ -139,6 +140,24 @@ class Chain:
         # We need to use a dict because torch.compile doesn't list lists of tensors
         self.parents_indices = [torch.tensor(p, dtype=torch.long, device=self.device) for p in self.parents_indices]
 
+    def set_base_transform(self, transform_matrix: torch.Tensor):
+        """
+        Sets the base transform for the kinematic chain.
+
+        Args:
+            transform_matrix: A 4x4 torch.Tensor representing the transformation matrix.
+        """
+        if not isinstance(transform_matrix, torch.Tensor):
+            raise TypeError(f"transform_matrix must be a torch.Tensor, got {type(transform_matrix)}")
+        if transform_matrix.shape != (4, 4):
+            raise ValueError(f"transform_matrix must be of shape (4, 4), got {transform_matrix.shape}")
+
+        self.base_transform = tf.Transform3d(matrix=transform_matrix, device=self.device, dtype=self.dtype)
+        # Ensure it's on the correct device/dtype, Transform3d constructor should handle it if matrix is already correct
+        # or if device/dtype are passed, but being explicit can be good.
+        # self.base_transform = self.base_transform.to(device=self.device, dtype=self.dtype)
+
+
     def to(self, dtype=None, device=None):
         if dtype is not None:
             self.dtype = dtype
@@ -147,6 +166,8 @@ class Chain:
         self._root = self._root.to(dtype=self.dtype, device=self.device)
 
         self.identity = self.identity.to(device=self.device, dtype=self.dtype)
+        if hasattr(self, 'base_transform') and self.base_transform is not None: # Check if initialized
+            self.base_transform = self.base_transform.to(device=self.device, dtype=self.dtype)
         self.parents_indices = [p.to(dtype=torch.long, device=self.device) for p in self.parents_indices]
         self.joint_type_indices = self.joint_type_indices.to(dtype=torch.long, device=self.device)
         self.joint_indices = self.joint_indices.to(dtype=torch.long, device=self.device)
@@ -350,10 +371,17 @@ class Chain:
 
             frame_transforms[frame_idx.item()] = frame_transform
 
-        frame_names_and_transform3ds = {self.idx_to_frame[frame_idx]: tf.Transform3d(matrix=transform) for
-                                        frame_idx, transform in frame_transforms.items()}
+        # First, create transforms relative to the robot's own base frame
+        link_transforms_in_base = {self.idx_to_frame[frame_idx]: tf.Transform3d(matrix=transform)
+                                   for frame_idx, transform in frame_transforms.items()}
 
-        return frame_names_and_transform3ds
+        # Apply the chain's base_transform to express link transforms in the world frame
+        world_transforms = {}
+        # self.base_transform is initialized in __init__ and moved in .to()
+        for name, T_link_in_base in link_transforms_in_base.items():
+            world_transforms[name] = self.base_transform.compose(T_link_in_base)
+
+        return world_transforms
 
     def ensure_tensor(self, th):
         """

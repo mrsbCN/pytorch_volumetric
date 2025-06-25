@@ -1,6 +1,7 @@
 import torch
 import pytorch_kinematics as pk
 import os
+import math # For pi
 
 # IMPORTANT SETUP INSTRUCTIONS:
 # Before running this script, ensure you have installed the modified pytorch_kinematics:
@@ -63,9 +64,27 @@ def run_fk_opt():
     end_effector_name = "end_effector_link"
     print(f"Kinematic chain created. End effector: {end_effector_name}")
 
-    # Define Target Position
+    # Define and set a base transformation for the robot
+    # For example, move the robot's base by (0.2, 0.1, 0.0) and rotate 45 deg around Z
+    base_offset_translation = torch.tensor([0.2, 0.1, 0.0], dtype=dtype, device=device)
+    angle_rad = math.pi / 4  # 45 degrees
+    c, s = math.cos(angle_rad), math.sin(angle_rad)
+    base_offset_rotation_matrix = torch.tensor([[c, -s, 0],
+                                                [s,  c, 0],
+                                                [0,  0, 1]], dtype=dtype, device=device)
+
+    # Create the 4x4 base transformation matrix
+    world_H_base = torch.eye(4, dtype=dtype, device=device)
+    world_H_base[:3, :3] = base_offset_rotation_matrix
+    world_H_base[:3, 3] = base_offset_translation
+
+    # Set the base transform on the chain
+    chain.set_base_transform(world_H_base)
+    print(f"Set robot base transform in world to:\n{world_H_base.cpu().numpy()}")
+
+    # Target position in the WORLD coordinate system
     target_pos = torch.tensor([0.7, 0.2, 0.0], dtype=dtype, device=device)
-    print(f"Target position: {target_pos.cpu().numpy()}")
+    print(f"Target position (in world frame): {target_pos.cpu().numpy()}")
 
     # Initialize Joint Angles
     joint_names = chain.get_joint_parameter_names(exclude_fixed=True)
@@ -115,7 +134,7 @@ def run_fk_opt():
 
         if i % 20 == 0:
             print(f"Iteration {i:03d} | Loss: {loss.item():.6f} | "
-                  f"Current Pos: {current_pos.squeeze().detach().cpu().numpy()} | "
+                  f"Current Pos (World): {current_pos.squeeze().detach().cpu().numpy()} | "
                   f"Joints: {th.squeeze().detach().cpu().numpy()}")
             if th.grad is not None:
                 print(f"    Grad Norm: {torch.linalg.norm(th.grad).item():.6f}")
@@ -131,8 +150,8 @@ def run_fk_opt():
 
     print(f"Initial joint angles: {initial_joint_angles}")
     print(f"Optimized joint angles: {th.detach().cpu().numpy().squeeze()}")
-    print(f"Target position: {target_pos.cpu().numpy()}")
-    print(f"Final end-effector position: {final_pos.detach().cpu().numpy().squeeze()}")
+    print(f"Target position (in world frame): {target_pos.cpu().numpy()}")
+    print(f"Final end-effector position (World): {final_pos.detach().cpu().numpy().squeeze()}")
     print(f"Final Loss: {loss.item():.6f}")
     print("\nrun_fk_optimization.py completed successfully.")
 
