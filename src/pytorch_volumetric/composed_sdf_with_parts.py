@@ -64,33 +64,34 @@ class ComposedSDFWithPartsFunction(Function):
             N_pts = pts_shape[-2] # Number of points per batch item
 
             # obj_frame_to_link_frame's matrix is [S*B, 4, 4]
-            # Order: (L0B0, L0B1, ..., L0B(B-1), L1B0, ..., LS-1B(B-1))
-            
-            all_pts_in_link_frame_batches = []
-            # For each item in the point batch
-            for b_idx in range(B):
-                # points_b: [N_pts, 3]
-                points_b = points_in_object_frame[b_idx]
-                
-                # Select S link transforms for this specific batch item b_idx
-                # These are at flattened indices: b_idx, B+b_idx, 2B+b_idx, ..., (S-1)B+b_idx
-                transform_indices_for_batch_b = torch.arange(S, device=obj_frame_to_link_frame.device) * B + b_idx
-                
-                # link_transforms_b_matrix: [S, 4, 4]
-                link_transforms_b_matrix = obj_frame_to_link_frame.get_matrix()[transform_indices_for_batch_b]
-                current_link_transforms_b = pk.Transform3d(matrix=link_transforms_b_matrix,
-                                                           dtype=link_transforms_b_matrix.dtype,
-                                                           device=link_transforms_b_matrix.device)
-                
-                # pts_b_in_link_frames: [S, N_pts, 3]
-                # (transform_points broadcasts [N_pts,3] points to S transforms in current_link_transforms_b)
-                pts_b_in_link_frames = current_link_transforms_b.transform_points(points_b)
-                all_pts_in_link_frame_batches.append(pts_b_in_link_frames)
+            B = tsf_batch[0] # Batch size for transforms and points
+            N_pts = pts_shape[-2] # Number of points per batch item, e.g., 500
 
-            # Stack to get [B, S, N_pts, 3]
-            pts_stacked_by_batch = torch.stack(all_pts_in_link_frame_batches, dim=0)
-            # Permute to [S, B, N_pts, 3] for iterating through SDFs first
-            pts = pts_stacked_by_batch.permute(1, 0, 2, 3).contiguous()
+            B = tsf_batch[0] # Batch size for transforms and points
+            N_pts = pts_shape[-2] # Number of points per batch item
+
+            # obj_frame_to_link_frame (T) has a matrix M of shape (S*B, 4, 4).
+            # So, T itself has batch_shape (S*B).
+            T_obj_to_link_flat_batch = obj_frame_to_link_frame
+
+            # points_in_object_frame (P_obj) has shape (B, N_pts, 3).
+            # We need to prepare P_obj to be transformed by T_obj_to_link_flat_batch.
+            # T_obj_to_link_flat_batch expects points with a leading batch dim of S*B or broadcastable.
+
+            # Expand P_obj for S links: P_obj_expanded -> (S, B, N_pts, 3)
+            P_obj_expanded_S_B_N_3 = points_in_object_frame.unsqueeze(0).expand(S, B, N_pts, 3)
+
+            # Reshape to match the flat batch of transforms: P_obj_flat -> (S*B, N_pts, 3)
+            P_obj_flat_SB_N_3 = P_obj_expanded_S_B_N_3.reshape(S * B, N_pts, 3)
+
+            # Transform points:
+            # T_obj_to_link_flat_batch (batch S*B) transforms P_obj_flat_SB_N_3 (batch S*B, N_pts, 3)
+            # pts_flat will have shape (S*B, N_pts, 3)
+            pts_flat_SB_N_3 = T_obj_to_link_flat_batch.transform_points(P_obj_flat_SB_N_3)
+            
+            # Reshape pts_flat to the desired [S, B, N_pts, 3] structure
+            pts = pts_flat_SB_N_3.view(S, B, N_pts, 3)
+            # pts[s,b,n,:] is point n of batch b, transformed into the frame of link s (for batch b)
 
 
         # pts is now [S, B, N, 3] (if tsf_batch was (B,)) or [S, N, 3] (if tsf_batch was None and input pts was [N,3])
@@ -173,5 +174,42 @@ class ComposedSDFWithPartsFunction(Function):
             
     #     # 返回所有输入参数的梯度，只有第一个(points)有梯度
     #     outputs = [None for _ in range(ctx.num_inputs)]
-    #     outputs[0] = dsdf_vals_dpoints  # points_in_object_frame的梯度
-    #     return tuple(outputs)
+    @staticmethod
+    def backward(ctx, grad_vv, grad_gg, grad_v_all_links, grad_g_all_links, grad_closest_link_indices):
+        """
+        Backward pass for ComposedSDFWithPartsFunction.
+        This is a placeholder implementation based on ObjectFrameSDF.backward.
+        It likely only correctly computes gradients for points_in_object_frame (input 0),
+        and will return None for transform-related inputs, which is the source of the error.
+        A full backward implementation is needed for transform gradients.
+        """
+        # final_sdf_grads_wrt_points_obj are the gradients of the final SDF values (vv)
+        # with respect to the points in the object frame that were fed into MeshSDF,
+        # but after selection of the closest link and transformation back to object frame.
+        # This is 'gg' saved from the forward pass.
+        final_sdf_grads_obj, = ctx.saved_tensors # 'gg' from forward
+
+        # Gradient for the first input: points_in_object_frame
+        # This input usually does not require grad in these scenarios.
+        grad_input_points = None
+        if ctx.needs_input_grad[0]:
+            if grad_vv is not None: # dLoss/dvv
+                # dLoss/d(points_in_object_frame) = dLoss/dvv * dvv/d(points_in_object_frame)
+                # where dvv/d(points_in_object_frame) is final_sdf_grads_obj
+                grad_input_points = grad_vv.unsqueeze(-1) * final_sdf_grads_obj
+
+        # Gradients for other inputs (sdfs, obj_frame_to_link_frame, tsf_batch, link_frame_to_obj_frame)
+        # are not computed here and will be None. This is why the error occurs if transforms need grad.
+        # inputs to forward:
+        # 0: points_in_object_frame
+        # 1: sdfs
+        # 2: obj_frame_to_link_frame
+        # 3: tsf_batch
+        # 4: link_frame_to_obj_frame
+
+        # To fix the "RuntimeError: element 0 of tensors does not require grad and does not have a grad_fn",
+        # we need to return a gradient for input 2 (obj_frame_to_link_frame) and/or input 4 (link_frame_to_obj_frame)
+        # if they require gradients. PyTorch's autograd would then continue back to joint_config.
+        # Calculating these gradients (grad_obj_to_link_tf, grad_link_to_obj_tf) is complex.
+
+        return grad_input_points, None, None, None, None # Grad for inputs 0, 1, 2, 3, 4
