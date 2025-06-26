@@ -94,8 +94,8 @@ class RobotSDF(sdf.ObjectFrameSDF):
         if len(joint_config.shape) > 1:
             self.configuration_batch = joint_config.shape[:-1]
             joint_config = joint_config.reshape(-1, M)
-        else:
-            self.configuration_batch = None
+        elif self.chain.B_base > 1:
+            self.configuration_batch = torch.Size([self.chain.B_base])
         tf = self.chain.forward_kinematics(joint_config, end_only=False)
         tsfs = []
         for link_name in self.sdf_to_link_name:
@@ -107,6 +107,11 @@ class RobotSDF(sdf.ObjectFrameSDF):
             expand_dims = (None,) * len(self.configuration_batch)
             offset_tsf_mat = offset_tsf.get_matrix()[(slice(None),) + expand_dims]
             offset_tsf_mat = offset_tsf_mat.repeat(1, *self.configuration_batch, 1, 1)
+            offset_tsf = pk.Transform3d(matrix=offset_tsf_mat.reshape(-1, 4, 4))
+        elif self.chain.B_base > 1:
+            expand_dims = (None,)
+            offset_tsf_mat = offset_tsf.get_matrix()[(slice(None),) + expand_dims]
+            offset_tsf_mat = offset_tsf_mat.repeat(1, self.chain.B_base, 1, 1)
             offset_tsf = pk.Transform3d(matrix=offset_tsf_mat.reshape(-1, 4, 4))
 
         tsfs = torch.cat(tsfs)

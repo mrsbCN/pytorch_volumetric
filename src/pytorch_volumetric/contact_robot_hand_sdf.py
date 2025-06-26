@@ -172,23 +172,16 @@ class ContactHandSDF(RobotSDF):
         # Update SDF transforms with gradient preservation
         self.sdf.set_transforms(object_to_link_frames, batch_dim=configuration_batch)
     
-    def forward(self, points_in_object_frame, joint_config=None):
+    def __call__(self, points_in_object_frame):
         """
         ContactGen-style forward pass with optional joint configuration
         
         :param points_in_object_frame: [..., N, 3] query points
-        :param joint_config: Optional joint configuration to use for this forward pass
         :return: tuple of (pred, pred_p_full) where:
                  - pred: [..., N] final contact predictions (SDF-based)
                  - pred_p_full: [..., N, P] part-wise contact predictions
         """
-        # If joint config is provided, compute transforms directly (preserving gradients)
-        if joint_config is not None:
-            sdf_vals, sdf_grads, sdf_per_link, sdf_per_link_grads, closest_link_indices = self._forward_with_dynamic_config(
-                points_in_object_frame, joint_config)
-        else:
-            # Use cached transforms (standard operation)
-            sdf_vals, sdf_grads, sdf_per_link, sdf_per_link_grads, closest_link_indices = self.sdf.forward_with_parts(points_in_object_frame)
+        sdf_vals, sdf_grads, sdf_per_link, sdf_per_link_grads, closest_link_indices = self.sdf.forward_with_parts(points_in_object_frame)
         
         # Convert SDF to contact probabilities
         pred = torch.sigmoid(-sdf_vals / self.contact_threshold)
@@ -202,44 +195,6 @@ class ContactHandSDF(RobotSDF):
         )
         
         return pred, pred_p_full
-    
-    def _forward_with_dynamic_config(self, points_in_object_frame, joint_config):
-        """
-        Forward pass with dynamic joint configuration (preserves gradients)
-        This bypasses set_transforms to maintain gradient flow
-        """
-        M = len(self.joint_names)
-        
-        # Handle batch dimensions
-        if len(joint_config.shape) > 1:
-            configuration_batch = joint_config.shape[:-1]
-            joint_config_flat = joint_config.reshape(-1, M)
-        else:
-            configuration_batch = None
-            joint_config_flat = joint_config
-        
-        # Forward kinematics with gradient preservation
-        tf = self.chain.forward_kinematics(joint_config_flat, end_only=False)
-        tsfs = []
-        for link_name in self.sdf_to_link_name:
-            tsfs.append(tf[link_name].get_matrix())
-        
-        # Handle offset transforms with compatible batch dimensions
-        offset_tsf = self.offset_transforms.inverse()
-        if configuration_batch is not None:
-            expand_dims = (None,) * len(configuration_batch)
-            offset_tsf_mat = offset_tsf.get_matrix()[(slice(None),) + expand_dims]
-            offset_tsf_mat = offset_tsf_mat.repeat(1, *configuration_batch, 1, 1)
-            offset_tsf = pk.Transform3d(matrix=offset_tsf_mat.reshape(-1, 4, 4))
-
-        tsfs = torch.cat(tsfs)
-        object_to_link_frames = offset_tsf.compose(pk.Transform3d(matrix=tsfs).inverse())
-        
-        # Call ComposedSDFWithPartsFunction directly with gradient-enabled transforms
-        return ComposedSDFWithPartsFunction.apply(
-            points_in_object_frame, self.sdf.sdfs, object_to_link_frames, 
-            configuration_batch, object_to_link_frames.inverse()
-        )
     
     def _create_part_aligned_predictions(self, sdf_per_link, closest_link_indices, points_shape):
         """

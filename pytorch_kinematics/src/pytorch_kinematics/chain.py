@@ -76,6 +76,7 @@ class Chain:
 
         self.identity = torch.eye(4, device=self.device, dtype=self.dtype).unsqueeze(0)
         self.base_transform = tf.Transform3d(device=self.device, dtype=self.dtype)
+        self.B_base = 1
 
         low, high = self.get_joint_limits()
         self.low = torch.tensor(low, device=self.device, dtype=self.dtype)
@@ -143,19 +144,26 @@ class Chain:
     def set_base_transform(self, transform_matrix: torch.Tensor):
         """
         Sets the base transform for the kinematic chain.
-
-        Args:
-            transform_matrix: A 4x4 torch.Tensor representing the transformation matrix.
+        The input can be a single (4,4) matrix or a batch of (B,4,4) matrices.
         """
         if not isinstance(transform_matrix, torch.Tensor):
-            raise TypeError(f"transform_matrix must be a torch.Tensor, got {type(transform_matrix)}")
-        if transform_matrix.shape != (4, 4):
-            raise ValueError(f"transform_matrix must be of shape (,4, 4), got {transform_matrix.shape}")
+            raise TypeError(f"transform_matrix must be a torch.Tensor. Got {type(transform_matrix)}")
 
+        if transform_matrix.ndim == 2:
+            if transform_matrix.shape != (4, 4):
+                raise ValueError(f"Input transform_matrix has shape {transform_matrix.shape}, but expected (4, 4) for a single matrix.")
+            self.B_base = 1
+        elif transform_matrix.ndim == 3:
+            if transform_matrix.shape[1:] != (4, 4):
+                raise ValueError(f"Input transform_matrix has shape {transform_matrix.shape}, but expected (B, 4, 4) for batched matrices.")
+            if transform_matrix.shape[0] == 0:
+                raise ValueError("Batch size for transform_matrix cannot be zero.")
+            self.B_base = transform_matrix.shape[0]
+        else:
+            raise ValueError(f"Input transform_matrix has an invalid number of dimensions: {transform_matrix.ndim}. Expected 2 or 3.")
+
+        # Store as Transform3d object, ensuring it's on the same device/dtype as the chain
         self.base_transform = tf.Transform3d(matrix=transform_matrix, device=self.device, dtype=self.dtype)
-        # Ensure it's on the correct device/dtype, Transform3d constructor should handle it if matrix is already correct
-        # or if device/dtype are passed, but being explicit can be good.
-        # self.base_transform = self.base_transform.to(device=self.device, dtype=self.dtype)
 
 
     def to(self, dtype=None, device=None):
@@ -327,58 +335,137 @@ class Chain:
         th = self.ensure_tensor(th)
         th = torch.atleast_2d(th)
 
-        b = th.shape[0]
-        axes_expanded = self.axes.unsqueeze(0).repeat(b, 1, 1)
+        B_th = th.shape[0]
+        axes_expanded = self.axes.unsqueeze(0).repeat(B_th, 1, 1)
 
         # compute all joint transforms at once first
-        # in order to handle multiple joint types without branching, we create all possible transforms
-        # for all joint types and then select the appropriate one for each joint.
         rev_jnt_transform = axis_and_angle_to_matrix_44(axes_expanded, th)
         pris_jnt_transform = axis_and_d_to_pris_matrix(axes_expanded, th)
 
-        frame_transforms = {}
+        # Get the base transformation matrix, ensure it's at least (1,4,4) for broadcasting
+        # self.base_transform is already a Transform3d object, on correct device/dtype
+        _initial_world_accumulator_matrix = self.base_transform.get_matrix().clone()
+        if _initial_world_accumulator_matrix.ndim == 2:
+            _initial_world_accumulator_matrix = _initial_world_accumulator_matrix.unsqueeze(0)  # Shape (1,4,4)
+        if self.B_base == 1 and B_th > 1:
+            # If base transform is a single matrix, we need to expand it to match B_th
+            _initial_world_accumulator_matrix = _initial_world_accumulator_matrix.repeat(B_th, 1, 1)
 
-        for frame_idx in frame_indices:
-            frame_transform = torch.eye(4).to(th).unsqueeze(0).repeat(b, 1, 1)
-            #frame_transform = base_identity.clone()
+        # Batch compatibility check
+        if self.B_base > 1 and B_th > 1 and self.B_base != B_th:
+            raise ValueError(f"Batch size of base_transform ({self.B_base}) and th ({B_th}) must be equal or one of them must be 1 for broadcasting.")
 
-            # iterate down the list and compose the transform
-            for chain_idx in self.parents_indices[frame_idx.item()]:
-                if chain_idx.item() in frame_transforms:
-                    frame_transform = frame_transforms[chain_idx.item()]
+        # frame_transforms will store the computed world-coordinate matrices (tensors) for memoization
+        # It maps integer frame indices to (Batch, 4, 4) tensors. Batch size is max(self.B_base, B_th)
+        frame_world_transforms_map = {}
+
+        # Ensure frame_indices is a list of integer items for dictionary keys and self.parents_indices access
+        # The input frame_indices is a tensor on self.device.
+        frame_indices_list = [idx_tensor.item() for idx_tensor in frame_indices]
+
+        for requested_frame_idx_item in frame_indices_list:
+            # Path for the current requested_frame_idx_item
+            path_to_requested_frame = self.parents_indices[requested_frame_idx_item]
+
+            # Initialize current_fk_matrix for the start of this path.
+            # It starts as the world base transform.
+            current_path_transform_matrix = _initial_world_accumulator_matrix.clone()
+
+            if th.requires_grad:
+                if th.numel() > 0:
+                    graph_connected_one = (th.view(-1)[0] - th.view(-1)[0].detach()) + 1.0
+                    current_path_transform_matrix = current_path_transform_matrix * graph_connected_one
+
+            # Iterate through the ancestors in the path for the current requested_frame_idx_item
+            # The first ancestor_idx in path_to_requested_frame is the root (index 0).
+            # For the root itself, current_path_transform_matrix (which is base_transform) is its world transform if root's offsets/joints are identity.
+            # If root has offsets/joint, they should be applied.
+
+            # Let's refine how current_path_transform_matrix is initialized before the ancestor loop.
+            # It should represent the transform of the PARENT of the first element in the current segment of the path.
+            # If the path starts from root (ancestor_idx = 0), parent_transform is _initial_world_accumulator_matrix.
+            # If we are calculating for a frame and its path is [0, 1, 2],
+            # for ancestor_idx = 0: parent_transform = _initial_world_accumulator_matrix. After processing 0, frame_world_transforms_map[0] is set.
+            # for ancestor_idx = 1: parent_transform = frame_world_transforms_map[0]. After processing 1, frame_world_transforms_map[1] is set.
+            # for ancestor_idx = 2: parent_transform = frame_world_transforms_map[1]. After processing 2, frame_world_transforms_map[2] is set.
+
+            last_processed_ancestor_transform = _initial_world_accumulator_matrix.clone()
+            if th.requires_grad and th.numel() > 0: # connect to graph if needed
+                graph_connected_one = (th.view(-1)[0] - th.view(-1)[0].detach()) + 1.0
+                last_processed_ancestor_transform = last_processed_ancestor_transform * graph_connected_one
+
+            # Find the point where path_to_requested_frame diverges from already computed paths
+            # or starts from root.
+            start_from_idx = 0 # which element in path_to_requested_frame to start computation from
+            for i, ancestor_idx_val_in_path in enumerate(path_to_requested_frame):
+                if ancestor_idx_val_in_path.item() in frame_world_transforms_map:
+                    last_processed_ancestor_transform = frame_world_transforms_map[ancestor_idx_val_in_path.item()]
+                    start_from_idx = i + 1 # Next iteration should start from child of this already computed frame
                 else:
-                    link_offset_i = self.link_offsets[chain_idx]
-                    if link_offset_i is not None:
-                        frame_transform = frame_transform @ link_offset_i
+                    break # This ancestor_idx_val_in_path and subsequent ones need to be computed
 
-                    joint_offset_i = self.joint_offsets[chain_idx]
-                    if joint_offset_i is not None:
-                        frame_transform = frame_transform @ joint_offset_i
+            # Accumulate transforms from the identified starting point
+            for i in range(start_from_idx, len(path_to_requested_frame)):
+                ancestor_idx_tensor = path_to_requested_frame[i]
+                ancestor_idx_item = ancestor_idx_tensor.item() # Integer index
 
-                    jnt_idx = self.joint_indices[chain_idx]
-                    jnt_type = self.joint_type_indices[chain_idx]
-                    if jnt_type == 0:
-                        pass
-                    elif jnt_type == 1:
-                        jnt_transform_i = rev_jnt_transform[:, jnt_idx]
-                        frame_transform = frame_transform @ jnt_transform_i
-                    elif jnt_type == 2:
-                        jnt_transform_i = pris_jnt_transform[:, jnt_idx]
-                        frame_transform = frame_transform @ jnt_transform_i
+                # current_fk_matrix for this ancestor_idx_item starts from its parent's world transform
+                current_fk_matrix = last_processed_ancestor_transform
 
-            frame_transforms[frame_idx.item()] = frame_transform
+                link_offset_i = self.link_offsets[ancestor_idx_item]
+                if link_offset_i is not None:
+                    current_fk_matrix = current_fk_matrix @ link_offset_i
 
-        # First, create transforms relative to the robot's own base frame
-        link_transforms_in_base = {self.idx_to_frame[frame_idx]: tf.Transform3d(matrix=transform)
-                                   for frame_idx, transform in frame_transforms.items()}
+                joint_offset_i = self.joint_offsets[ancestor_idx_item]
+                if joint_offset_i is not None:
+                    current_fk_matrix = current_fk_matrix @ joint_offset_i
 
-        # Apply the chain's base_transform to express link transforms in the world frame
-        world_transforms = {}
-        # self.base_transform is initialized in __init__ and moved in .to()
-        for name, T_link_in_base in link_transforms_in_base.items():
-            world_transforms[name] = self.base_transform.compose(T_link_in_base)
+                jnt_idx = self.joint_indices[ancestor_idx_item]
+                jnt_type = self.joint_type_indices[ancestor_idx_item]
 
-        return world_transforms
+                if jnt_type != 0: # If not a fixed joint
+                    # Ensure batch sizes are compatible for matmul:
+                    # current_fk_matrix could be (self.B_base,4,4) or (max(self.B_base,B_th),4,4)
+                    # jnt_transform could be (B_th,4,4)
+                    # PyTorch matmul broadcasting: (J,N,M) @ (K,M,P) -> (JorK, N,P) if J or K is 1
+                    # Here: (B_cur,4,4) @ (B_th,4,4) where B_cur is self.B_base or max(self.B_base,B_th)
+                    # This requires B_cur == B_th or one of them is 1. This is handled by the initial check.
+                    if jnt_type == 1: # Revolute
+                        jnt_transform_for_ancestor = rev_jnt_transform[:, jnt_idx]
+                        current_fk_matrix = current_fk_matrix @ jnt_transform_for_ancestor
+                    elif jnt_type == 2: # Prismatic
+                        jnt_transform_for_ancestor = pris_jnt_transform[:, jnt_idx]
+                        current_fk_matrix = current_fk_matrix @ jnt_transform_for_ancestor
+
+                frame_world_transforms_map[ancestor_idx_item] = current_fk_matrix
+                last_processed_ancestor_transform = current_fk_matrix
+            # After iterating through all ancestors for requested_frame_idx_item,
+            # its transform is in frame_world_transforms_map[requested_frame_idx_item]
+            # OR, if path_to_requested_frame was empty (e.g. asking for a non-existent frame, though parents_indices should handle this)
+            # or if all its ancestors were already computed, it's in last_processed_ancestor_transform.
+            # The map should always have the entry due to the loop structure.
+
+        # Construct the output dictionary using only the originally requested frame indices
+        output_transform_objects = {}
+        for requested_frame_idx_tensor in frame_indices: # Iterate over the original input frame_indices
+            idx_val = requested_frame_idx_tensor.item()
+            if idx_val in frame_world_transforms_map:
+                 output_transform_objects[self.idx_to_frame[idx_val]] = tf.Transform3d(
+                    matrix=frame_world_transforms_map[idx_val],
+                    device=self.device,
+                    dtype=self.dtype
+                )
+            # else: # Should not happen if frame_indices are valid and parents_indices is correct
+            #    pass # Or raise error, or handle case of root frame if it's 0 and path is empty
+                       # If path_to_requested_frame is empty (e.g. for frame_idx 0 if it has no "parent" in parents_indices[0])
+                       # then frame_world_transforms_map[0] would not be set by the inner loop.
+                       # This logic assumes parents_indices[0] = [0] for root.
+                       # If requested_frame_idx_item is 0 (root), and parents_indices[0] is [0],
+                       # start_from_idx will be 0. Loop range(0,1) runs for i=0, ancestor_idx_tensor=0.
+                       # current_fk_matrix = last_processed_ancestor_transform (which is base_transform * graph_one)
+                       # then offsets and joint transforms for frame 0 are applied. This is correct.
+
+        return output_transform_objects
 
     def ensure_tensor(self, th):
         """
@@ -703,4 +790,3 @@ class MimicChain(Chain):
             print("\nMimic关节配置:")
             for joint_name, config in self.mimic_config.items():
                 print(f"  {joint_name} -> {config['parent']} (multiplier: {config['multiplier']}, offset: {config['offset']})")
-

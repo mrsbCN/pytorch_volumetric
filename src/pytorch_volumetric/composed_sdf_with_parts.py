@@ -37,7 +37,7 @@ class ComposedSDFWithPartsFunction(Function):
     - pred_p_full: part-wise predictions for all links
     - closest_link_indices: which link is closest for each point
     """
-    
+    @staticmethod
     def forward(ctx, points_in_object_frame, sdfs, obj_frame_to_link_frame, tsf_batch, link_frame_to_obj_frame):
         pts_shape = points_in_object_frame.shape  # 保存原始形状，例如 [B, N, 3]
         # flatten it for the transform

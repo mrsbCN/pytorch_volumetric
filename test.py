@@ -42,21 +42,23 @@ obj_verts = torch.rand(batch_size, 500, 3, device=device) * 0.08
 obj_cmap = torch.rand(batch_size, 500, device=device) > 0.7  # Binary contact
 obj_partition = torch.randint(0, 16, (batch_size, 500), device=device)  # Random parts
 w_contact = 1.0
-global_pose = torch.zeros((3), dtype=obj_verts.dtype, device=obj_verts.device)
-mano_trans = torch.zeros((3), dtype=obj_verts.dtype, device=obj_verts.device)
+global_pose = torch.zeros((batch_size, 3), dtype=obj_verts.dtype, device=obj_verts.device)
+mano_trans = torch.zeros((batch_size, 3), dtype=obj_verts.dtype, device=obj_verts.device)
 rot_matrix = tf.euler_angles_to_matrix(mano_trans, "XYZ")
-base_transform_matrix = torch.zeros(( 4, 4), dtype=obj_verts.dtype, device=obj_verts.device)
-base_transform_matrix[:3, 3] = global_pose
-base_transform_matrix[:3, :3] = rot_matrix
+base_transform_matrix = torch.eye(4, dtype=obj_verts.dtype, device=obj_verts.device)
+base_transform_matrix = base_transform_matrix.unsqueeze(0).repeat(batch_size, 1, 1)
+base_transform_matrix[..., :3, 3] = global_pose
+base_transform_matrix[..., :3, :3] = rot_matrix
 base_transform_matrix.requires_grad = True
 
 for it in range(1000):
     optimizer.zero_grad()
 
     contact_hand_sdf.chain.set_base_transform(base_transform_matrix)
+    contact_hand_sdf.set_joint_configuration()
     
     # Compute predictions with joint configuration (preserves gradient flow)
-    pred, pred_p_full = contact_hand_sdf.forward(obj_verts, joint_config)
+    pred, pred_p_full = contact_hand_sdf(obj_verts)
     
     # Contact loss (ContactGen style)
     pred_p = torch.gather(pred_p_full, dim=-1, index=obj_partition.unsqueeze(dim=-1)).squeeze(-1)
