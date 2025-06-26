@@ -29,15 +29,17 @@ except Exception as e:
     print(f"✗ Failed to create ContactHandSDF: {e}")
 
 # Set initial joint configuration
+batch_size = 10  # Define batch_size earlier for joint_config
 n_joints = len(contact_hand_sdf.joint_names)
-joint_config = torch.zeros(n_joints, device=device)
+# Create a batched joint_config, e.g., all zeros
+joint_config = torch.zeros(batch_size, n_joints, device=device, requires_grad=True) 
 contact_hand_sdf.set_joint_configuration(joint_config)
-print(f"✓ Joint configuration set ({n_joints} joints)")
+print(f"✓ Batched joint configuration set ({batch_size} batches, {n_joints} joints per batch)")
 
 
 # Setup optimization
-batch_size = 10
-optimizer = torch.optim.Adam([joint_config], lr=0.01)
+# batch_size is already defined
+optimizer = torch.optim.Adam([joint_config], lr=0.01) # joint_config is now the learnable batched parameter
 obj_verts = torch.rand(batch_size, 500, 3, device=device) * 0.08
 obj_cmap = torch.rand(batch_size, 500, device=device) > 0.7  # Binary contact
 obj_partition = torch.randint(0, 16, (batch_size, 500), device=device)  # Random parts
