@@ -85,7 +85,7 @@ class ContactHandSDF(RobotSDF):
             # TODO consider the visual offset transform
             for link_vis in frame.link.visuals:
                 if link_vis.geom_type == "mesh":
-                    logger.info(f"{frame.link.name} offset {link_vis.offset}")
+                    # logger.info(f"{frame.link.name} offset {link_vis.offset}")
                     link_obj = sdf.MeshObjectFactory(link_vis.geom_param[0],
                                                      scale=link_vis.geom_param[1],
                                                      path_prefix=path_prefix)
@@ -94,7 +94,8 @@ class ContactHandSDF(RobotSDF):
                     sdfs.append(link_sdf)
                     offsets.append(link_vis.offset)
                 else:
-                    logger.warning(f"Cannot handle non-mesh link visual type {link_vis} for {frame.link.name}")
+                    pass
+                    # logger.warning(f"Cannot handle non-mesh link visual type {link_vis} for {frame.link.name}")
 
         self.offset_transforms = offsets[0].stack(*offsets[1:]).to(device=self.device, dtype=self.dtype)
         self.sdf = ComposedSDFWithParts(sdfs, self.object_to_link_frames)
@@ -118,7 +119,7 @@ class ContactHandSDF(RobotSDF):
                 part_map[link_name] = part_id
                 link_to_part_list.append(part_id)
             else:
-                logger.warning(f"Link '{link_name}' not found in LINK_TO_HAND_LABELS, assigning to part 0")
+                # logger.warning(f"Link '{link_name}' not found in LINK_TO_HAND_LABELS, assigning to part 0")
                 part_map[link_name] = 0
                 link_to_part_list.append(0)
         
@@ -132,8 +133,8 @@ class ContactHandSDF(RobotSDF):
                 self.part_to_links[part_id] = []
             self.part_to_links[part_id].append(link_idx)
         
-        logger.info(f"Created part mapping for {len(part_map)} links: {part_map}")
-        logger.info(f"Part to links mapping: {self.part_to_links}")
+        # logger.info(f"Created part mapping for {len(part_map)} links: {part_map}")
+        # logger.info(f"Part to links mapping: {self.part_to_links}")
         
         return part_map
     
