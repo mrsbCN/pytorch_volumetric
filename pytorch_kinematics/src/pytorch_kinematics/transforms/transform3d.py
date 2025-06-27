@@ -1,6 +1,32 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 import math
+import torch # Ensure torch is imported for the helper
+
+# Helper function for checking tensor gradient health
+def _check_tensor_grad_health(tensor, op_name="UnknownOp", context_id="N/A"):
+    if tensor is None:
+        print(f"TensorHealthCheck - Op: {op_name} - ContextID: {context_id} - Tensor is None")
+        return
+
+    # Reduce verbosity for non-grad tensors initially
+    if not tensor.requires_grad:
+        print(f"TensorHealthCheck - Op: {op_name} - ContextID: {context_id} - tensor.requires_grad: False. Is_leaf: {tensor.is_leaf}.")
+        print("---")
+        return
+
+    grad_fn_name = tensor.grad_fn.name() if hasattr(tensor, 'grad_fn') and tensor.grad_fn and hasattr(tensor.grad_fn, 'name') else (str(tensor.grad_fn) if hasattr(tensor, 'grad_fn') and tensor.grad_fn else 'None')
+    print(f"TensorHealthCheck - Op: {op_name} - ContextID: {context_id} - tensor.requires_grad: {tensor.requires_grad} - tensor.grad_fn: {grad_fn_name} - is_leaf: {tensor.is_leaf}")
+
+    plus_zero = tensor + 0.0
+    plus_zero_grad_fn_name = plus_zero.grad_fn.name() if hasattr(plus_zero, 'grad_fn') and plus_zero.grad_fn and hasattr(plus_zero.grad_fn, 'name') else (str(plus_zero.grad_fn) if hasattr(plus_zero, 'grad_fn') and plus_zero.grad_fn else 'None')
+    print(f"TensorHealthCheck - Op: {op_name} - ContextID: {context_id} - (tensor+0.0).requires_grad: {plus_zero.requires_grad} - (tensor+0.0).grad_fn: {plus_zero_grad_fn_name}")
+
+    cloned = tensor.clone()
+    cloned_grad_fn_name = cloned.grad_fn.name() if hasattr(cloned, 'grad_fn') and cloned.grad_fn and hasattr(cloned.grad_fn, 'name') else (str(cloned.grad_fn) if hasattr(cloned, 'grad_fn') and cloned.grad_fn else 'None')
+    print(f"TensorHealthCheck - Op: {op_name} - ContextID: {context_id} - tensor.clone().requires_grad: {cloned.requires_grad} - tensor.clone().grad_fn: {cloned_grad_fn_name}")
+    print("---")
+
 import typing
 import warnings
 from typing import Optional
@@ -216,6 +242,7 @@ class Transform3d:
         self._lu = None
         self.device = device
         self.dtype = self._matrix.dtype
+        _check_tensor_grad_health(self._matrix, "Transform3D_init_end", context_id=str(id(self)))
 
     def __len__(self):
         return self.get_matrix().shape[0]
@@ -245,7 +272,8 @@ class Transform3d:
         for other in others:
             mat = _broadcast_bmm(mat, other.get_matrix())
 
-        out = Transform3d(device=self.device, dtype=self.dtype, matrix=mat)
+        _check_tensor_grad_health(mat, "Transform3D_compose_final_mat", context_id=str(id(self)))
+        out = Transform3d(device=self.device, dtype=self.dtype, matrix=mat) # __init__ will call its own check
         return out
 
     def get_matrix(self):
@@ -287,8 +315,9 @@ class Transform3d:
         """
 
         i_matrix = self._get_matrix_inverse()
+        _check_tensor_grad_health(i_matrix, "Transform3D_inverse_i_matrix", context_id=str(id(self)))
 
-        tinv = Transform3d(matrix=i_matrix, device=self.device)
+        tinv = Transform3d(matrix=i_matrix, device=self.device) # __init__ will call its own check
 
         return tinv
 

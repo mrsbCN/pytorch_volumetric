@@ -81,15 +81,6 @@ class ComposedSDFWithPartsFunction(Function):
             # T_obj_to_link_flat_batch (batch S*B) transforms P_obj_flat_SB_N_3 (batch S*B, N_pts, 3)
             # pts_flat will have shape (S*B, N_pts, 3)
             pts_flat_SB_N_3 = T_obj_to_link_flat_batch.transform_points(P_obj_flat_SB_N_3)
-
-            # ---- DEBUG PRINTS for pts_flat_SB_N_3 (points in link frame before reshape) ----
-            print(f"ComposedSDF DEBUG: pts_flat_SB_N_3.requires_grad = {pts_flat_SB_N_3.requires_grad}")
-            if pts_flat_SB_N_3.grad_fn:
-                print(f"ComposedSDF DEBUG: pts_flat_SB_N_3.grad_fn = {pts_flat_SB_N_3.grad_fn.name()}")
-            else:
-                print(f"ComposedSDF DEBUG: pts_flat_SB_N_3.grad_fn = None")
-            # ---- END DEBUG PRINTS ----
-
             # Reshape pts_flat to the desired [S, B, N_pts, 3] structure
             pts = pts_flat_SB_N_3.view(S, B, N_pts, 3)
             # pts[s,b,n,:] is point n of batch b, transformed into the frame of link s (for batch b)
