@@ -137,6 +137,16 @@ class ContactHandSDF(RobotSDF):
         # logger.info(f"Part to links mapping: {self.part_to_links}")
         
         return part_map
+
+    def force_update_transforms(self):
+        """Forces recomputation of SDF transforms using current chain state."""
+        if self.q is not None: # Only if a joint config is set
+            self._update_transforms_with_grad(self.q)
+        else:
+            # This case might indicate that set_joint_configuration was not called appropriately before
+            # needing an update due to other changes (e.g. base_transform).
+            logger.warning("force_update_transforms called when self.q is None. "
+                           "SDF transforms might not reflect the latest chain state if q is expected to be set.")
     
     def _update_transforms_with_grad(self, joint_config):
         """
