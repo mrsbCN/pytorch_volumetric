@@ -12,7 +12,7 @@ urdf = "kuka_iiwa/model.urdf"
 search_path = pybullet_data.getDataPath()
 full_urdf = os.path.join(search_path, urdf)
 chain = pk.build_serial_chain_from_urdf(open(full_urdf).read(), "lbr_iiwa_link_7")
-d = "cuda" if torch.cuda.is_available() else "cpu"
+d = "cpu"
 
 chain = chain.to(device=d)
 # paths to the link meshes are specified with their relative path inside the URDF

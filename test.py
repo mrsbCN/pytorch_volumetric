@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 try:
     with open("hand/schunk_svh_hand_right.urdf", "rb") as f:
         chain = pk.build_mimic_chain_from_urdf(f.read())
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu"
     chain = chain.to(device=device)
     print(f"✓ Hand model loaded on {device}")
 except Exception as e:
